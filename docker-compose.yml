@@ -14,7 +14,7 @@ services:
       retries: 30
 
   sqs:
-    image: localstack/localstack:latest
+    image: localstack/localstack:3
     environment:
       SERVICES: sqs
     ports:
@@ -33,7 +33,7 @@ services:
       postgres:
         condition: service_healthy
       sqs:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "3000:3000"
     environment:
@@ -41,7 +41,7 @@ services:
       DB_PORT: "5432"
       DB_USER: wager
       DB_PASSWORD: wager
-      DB_NAME: wagering
+      DB_NAME: wager
       SQS_ENDPOINT: http://sqs:4566
       PORT: "3000"
     command: sh -c "bun run migration:up && bun run start"
