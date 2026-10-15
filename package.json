@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/main.ts",
-    "migration:create": "mikro-orm migration:create",
-    "migration:up": "mikro-orm migration:up",
-    "migration:down": "mikro-orm migration:down",
+    "migration:create": "bun run scripts/migration-create.ts",
+    "migration:up": "bun run scripts/migration-up.ts",
+    "migration:down": "bun run scripts/migration-down.ts",
     "test": "bun test",
     "test:load": "bun test test/load"
   },
