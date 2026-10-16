@@ -4,13 +4,13 @@
   "description": "Distributed wagering transaction processor with ledger-based accounting, idempotency and at-least-once messaging guarantees",
   "type": "module",
   "scripts": {
+    "test": "bun test",
     "setup:queues": "bun scripts/setup-queues.ts",
     "start": "bun run src/main.ts",
     "migration:create": "bun run scripts/migration-create.ts",
     "migration:up": "bun run scripts/migration-up.ts",
     "migration:down": "bun run scripts/migration-down.ts",
-    "test": "bun test",
-    "test:load": "bun test test/load"
+    "test:load": "bun scripts/load-test.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.700.0",
@@ -31,6 +31,7 @@
   "devDependencies": {
     "@mikro-orm/cli": "^6.4.0",
     "@testcontainers/postgresql": "^10.0.0",
+    "@types/bun": "^1.4.3",
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.5",
     "@types/uuid": "^10.0.0",
