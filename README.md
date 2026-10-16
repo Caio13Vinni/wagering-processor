@@ -16,27 +16,47 @@
 
 ## 🧠 Arquitetura
 
+### ▶️ Diagrama animado — a história de uma aposta
+
+![Fluxo de uma aposta BET — diagrama animado](docs/fluxo-bet.gif)
+
+Fluxo completo em 8 passos: envio da aposta → idempotência + lock pessimista → commit atômico →
+replay com saldo original → corrida de saldo (2× BET 80) → evento do outbox → REFUND fora de
+ordem resolvido pelo worker de `PENDING_REFERENCE`.
+
+> O diagrama é gerado com [Brainagram](https://github.com/LucasNasc/brainagram) a partir do
+> arquivo-fonte [`docs/fluxo-bet.brain`](./docs/fluxo-bet.brain) (texto versionado — diffs de
+> fluxo aparecem no PR). Para regenerar o GIF:
+>
+> ```bash
+> git clone https://github.com/LucasNasc/brainagram.git && cd brainagram
+> cp .env.example .env && docker compose up -d
+> sed -i "s/SECRET_KEY_BASE=.*/SECRET_KEY_BASE=$(openssl rand -hex 64)/" .env
+> docker compose up -d
+> # importe docs/fluxo-bet.brain e exporte o GIF animado para docs/fluxo-bet.gif
+> ```
+
 ```mermaid
 flowchart LR
   subgraph Entrada
-    HTTP[HTTP API<br/>REST] --> UC
-    SQS[[SQS FIFO<br/>wager-transactions.fifo]] --> C[SqsConsumer<br/>inbox dedup]
+    HTTP["HTTP API<br/>REST"] --> UC
+    SQS[["SQS FIFO<br/>wager-transactions.fifo"]] --> C["SqsConsumer<br/>inbox dedup"]
     C --> UC
   end
-  UC[SubmitWagerTransactionUseCase<br/>lock pessimista por wallet]
-  subgraph PostgreSQL[(PostgreSQL)]
-    W[wallets<br/>saldo + version<br/>CHECK balance >= 0]
-    L[(wallet_ledger<br/>append-only · trigger)]
-    T[wager_transactions<br/>idempotência + status]
-    IN[inbox_messages]
-    OUT[outbox_messages<br/>eventos atômicos]
+  UC["SubmitWagerTransactionUseCase<br/>lock pessimista por wallet"]
+  subgraph PG["PostgreSQL"]
+    W["wallets<br/>saldo + version<br/>CHECK balance >= 0"]
+    L[("wallet_ledger<br/>append-only - trigger")]
+    T["wager_transactions<br/>idempotencia + status"]
+    IN["inbox_messages"]
+    OUT["outbox_messages<br/>eventos atomicos"]
   end
   UC --> W & L & T & IN & OUT
-  OUT --> P[OutboxPublisherWorker<br/>claim atômico SKIP LOCKED]
-  P --> EV[[wager-events.fifo]]
-  T -.->|PENDING_REFERENCE| PRW[PendingReferenceWorker<br/>cron 10s + backoff]
+  OUT --> P["OutboxPublisherWorker<br/>claim atomico SKIP LOCKED"]
+  P --> EV[["wager-events.fifo"]]
+  T -.->|PENDING_REFERENCE| PRW["PendingReferenceWorker<br/>cron 10s + backoff"]
   PRW --> UC
-  DLQ[[wager-transactions-dlq.fifo]] -.redrive 5x.-> SQS
+  DLQ[["wager-transactions-dlq.fifo"]] -.->|redrive 5x| SQS
 ```
 
 **Invariantes no schema** (não só no código): `CHECK (balance >= 0)` · ledger imutável via trigger ·
@@ -136,6 +156,9 @@ src/
 │   └── auth/           # JwtAuthGuard (JWKS, azp) — flag AUTH_ENABLED
 ├── workers/            # outbox publisher (claim atômico) + pending-reference
 └── config/             # env, mikro-orm (init manual — Bun), orm
+docs/
+├── fluxo-bet.brain      # diagrama de sequência (Brainagram) — fonte do GIF
+└── fluxo-bet.gif        # diagrama animado do fluxo de uma aposta
 test/
 ├── unit/               # Money
 ├── integration/        # regras de wagering, idempotência (Postgres real)
