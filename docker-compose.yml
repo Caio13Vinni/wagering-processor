@@ -7,6 +7,8 @@ services:
       POSTGRES_DB: wager
     ports:
       - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wager"]
       interval: 2s
@@ -19,8 +21,6 @@ services:
       SERVICES: sqs
     ports:
       - "4566:4566"
-    volumes:
-      - ./scripts:/etc/localstack/init/ready.d
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
       interval: 3s
@@ -45,3 +45,6 @@ services:
       SQS_ENDPOINT: http://sqs:4566
       PORT: "3000"
     command: sh -c "bun run migration:up && bun run start"
+
+volumes:
+  pgdata:

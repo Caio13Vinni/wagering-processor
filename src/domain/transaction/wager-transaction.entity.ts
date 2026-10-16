@@ -50,7 +50,7 @@ export class WagerTransactionEntity {
   @Property({ type: 'uuid', nullable: true })
   referenceTransactionId?: string;
 
-  @Property({ length: 16, index: true })
+  @Property({ length: 32, index: true })
   status!: string;
 
   @Property({ length: 48, nullable: true })

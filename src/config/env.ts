@@ -4,7 +4,7 @@ export const env = {
     port: Number(process.env.DB_PORT ?? 5432),
     user: process.env.DB_USER ?? 'wager',
     password: process.env.DB_PASSWORD ?? 'wager',
-    name: process.env.DB_NAME ?? 'wagering',
+    name: process.env.DB_NAME ?? 'wager',
   },
   sqs: {
     endpoint: process.env.SQS_ENDPOINT ?? 'http://localhost:4566',
