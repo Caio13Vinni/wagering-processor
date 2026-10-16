@@ -14,6 +14,14 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    command: start-dev
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8080:8080"
 
   sqs:
     image: localstack/localstack:3
@@ -48,3 +56,4 @@ services:
 
 volumes:
   pgdata:
+
