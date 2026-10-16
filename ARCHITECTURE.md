@@ -7,180 +7,169 @@ HTTP --> WalletController / WageringController --+
                                                  +--> SubmitWagerTransactionUseCase
 SQS --> SqsConsumer (inbox) ---------------------+         |
                                                           v
-                               +- wallets (saldo materializado, versionado)
-                               +- wallet_ledger (imutável, append-only)
-                  PostgreSQL ---+- wager_transactions (status machine + idempotência)
+                               +- wallets (saldo materializado, versionado, CHECK balance>=0)
+                               +- wallet_ledger (imutável: append-only por TRIGGER)
+                  PostgreSQL ---+- wager_transactions (idempotência, status machine, FKs deferrables)
                                +- inbox_messages (dedup por entrega)
                                +- outbox_messages (eventos, atômicos c/ o commit)
                                                           |
                                OutboxPublisherWorker <----+
-                                          | (cron 5s, SKIP LOCKED)
+                                          | (cron 5s, claim atômico SKIP LOCKED)
                                           v
                                wager-events.fifo
 ```
 
 ## Dinheiro
 
-- `Money` é um value object imutável sobre `decimal.js`, serializado como
-  string decimal com escala 2 (`{ "amount": "25.00", "currency": "BRL" }`).
-- Nenhum `number`/`float` em nenhuma camada; o domínio não conhece tipos
-  monetários do ORM (o entity guarda `numeric(19,2)` como string e reidrata).
-- Moeda única assumida (BRL) por escopo, mas o modelo é multi-moeda e
-  conflitos de moeda são validados (rejeição com `CURRENCY_MISMATCH`).
+- `Money` é value object imutável sobre `decimal.js`, serializado como string decimal
+  escala 2 (`{ "amount": "25.00", "currency": "BRL" }`).
+- Nenhum `number`/`float` em nenhuma camada; o domínio não conhece tipos monetários
+  do ORM (a entity guarda `numeric(19,2)` como string e reidrata).
+- Moeda única assumida (BRL) por escopo; modelo multi-moeda com validação de conflito
+  (`CURRENCY_MISMATCH`).
 
 ## Unidade de concorrência e locks
 
-A unidade de concorrência é a **wallet**. Estratégia em camadas:
+A unidade de concorrência é a **wallet**. Três camadas:
 
-1. **Lock pessimista** `SELECT ... FOR UPDATE` na wallet por transação —
-   duas apostas disputando o mesmo saldo serializam; wallets diferentes
-   não se bloqueiam (sem lock global).
-2. **Optimistic locking como segunda barreira**: o `UPDATE wallets ...
-   WHERE id = ? AND version = ?` condiciona o update à versão lida sob lock;
-   `updated = 0` -> `CONCURRENT_MODIFICATION` (erro de programação, não de
-   negócio).
-3. **Constraint de schema**: `CHECK (balance >= 0)` — mesmo alguém executando
-   SQL manual não consegue saldo negativo. A invariante vive no banco, não
-   só no código.
+1. **Lock pessimista** `SELECT ... FOR UPDATE` por transação — wallets diferentes não
+   se bloqueiam (sem lock global).
+2. **Optimistic como segunda barreira**: `UPDATE wallets ... WHERE id = ? AND version = ?`
+   → `updated = 0` lança `CONCURRENT_MODIFICATION`.
+3. **Constraints do schema**: `CHECK (balance >= 0)` e índices — a invariante vive no banco.
 
-Cenário validado: saldo 100, duas apostas de 80 simultâneas -> exatamente uma
-PROCESSED, outra REJECTED `INSUFFICIENT_BALANCE`, saldo 20, um lançamento no
-ledger. Teste de 50 submissões paralelas da mesma aposta -> 1 débito, 49 replays.
+Cenário validado: saldo 100, duas apostas de 80 simultâneas → 1 PROCESSED, 1 REJECTED,
+saldo 20, um lançamento. 50× paralelo da mesma aposta → 1 débito, 49 replays.
 
 ## Idempotência (a constraint é a fonte final)
 
 Três camadas, da otimização à garantia:
 
-1. **Broker** (`MessageDeduplicationId`, ordering FIFO): otimização apenas.
-   Detalhe operacional: a janela de dedup do SQS é de 5 min e **descarta
-   silenciosamente** mensagens com mesmo dedup-id e body diferente — por isso
-   nunca é garantia (restr. 3 do desafio).
+1. **Broker** (`MessageDeduplicationId`, FIFO): otimização. Detalhe: a janela SQS é 5 min
+   e descarta silenciosamente mesmo dedup-id com body diferente — nunca é a garantia.
 2. **Inbox persistente** (`inbox_messages`, unique `(consumer_name, message_id)`):
-   dedup por *entrega*, no mesmo commit do processamento. `INSERT ... ON
-   CONFLICT DO NOTHING RETURNING` — atômico, sem check-then-insert.
-3. **Idempotency-key** (`wager_transactions.idempotency_key` unique +
-   `payload_hash`): dedup por *operação de negócio*. A mesma key com payload
-   divergente é **conflito** (`409`), nunca replay.
+   dedup por *entrega*, no mesmo commit. `INSERT ... ON CONFLICT DO NOTHING RETURNING`.
+3. **Idempotency-key** (`wager_transactions.idempotency_key` unique + `payload_hash`):
+   mesma key + payload divergente = **conflito (409)**, nunca replay.
 
-**Corrida de idempotência:** duas requisições com a mesma key passam pela
-checagem em memória simultaneamente; a unique constraint decide quem venceu.
-A transação perdedora aborta e o código trata a violação (`23505`) como caminho
-feliz, com três desfechos semanticamente distintos:
-
-- winner visível + hash igual -> **replay** (200), retornando o
-  `resulting_balance` **observado no processamento** (regra 7), sem lock na
-  wallet;
-- winner visível + hash diferente -> **409** (conflito real);
-- winner não visível após retry com backoff -> **erro transitório** (`503` em
-  HTTP, visibility expira em SQS). Nunca mentir `409` para um redelivery
-  legítimo: `409` mata reenvios at-least-once.
-
-Re-leitura em **fork novo**: a transação abortada não pode mais executar SQL
-(`current transaction is aborted`).
+**Corrida de idempotência:** a unique constraint decide quem venceu; a perdedora trata
+o `23505` como caminho feliz, com três desfechos distintos: replay (hash igual, devolve
+`resulting_balance` original — regra 7 — sem lock), 409 real (hash difere), ou 503
+transitório (winner não visível após retry — nunca mentir 409 pra redelivery). A
+re-leitura ocorre em **fork novo** (a transação abortada não executa mais SQL).
 
 ## Transacionalidade e outbox
 
-Wallet + ledger + transação + inbox + outbox no **mesmo commit**.
-Eventos nunca são publicados antes do commit (restr. 4). O
-`OutboxPublisherWorker` (cron 5s) usa `SELECT ... FOR UPDATE SKIP LOCKED` para
-múltiplas instâncias pegarem lotes disjuntos; `markPublished` é condicional
-(`WHERE published_at IS NULL`); publish duplicado é seguro para o consumidor
-(dedup por `eventId`). Falhas de publish usam backoff exponencial com teto.
+Wallet + ledger + transação + inbox + outbox no **mesmo commit**. Eventos nunca
+publicados antes do commit. O publisher (cron 5s) usa **claim atômico**:
 
-Ledger é **append-only**: sem UPDATE/DELETE, `UNIQUE(transaction_id)` garante
-<= 1 lançamento por transação, e `balance_before +/- amount = balance_after` é
-verificada na factory. REJECTED e LOSS não geram lançamento.
+```sql
+UPDATE outbox_messages SET lease_owner = ?, leased_until = now() + interval '30 seconds'
+WHERE id IN (SELECT id ... WHERE published_at IS NULL AND (lease_owner IS NULL OR leased_until < now())
+             ORDER BY occurred_at LIMIT 10 FOR UPDATE SKIP LOCKED)
+RETURNING ...
+```
+
+Um único statement segura os locks até o fim — instâncias concorrentes nunca pegam o
+mesmo lote (sem depender do dedup do broker). Crash após o claim é recuperado pelo
+`leased_until` expirando. Falhas de publish usam backoff exponencial com teto e
+**esgotamento** (após 8 tentativas o evento é estacionado, auditável, sai do ciclo).
+
+Ledger é append-only: **trigger bloqueia UPDATE/DELETE**, `UNIQUE(transaction_id)`
+garante ≤ 1 lançamento por transação; `balance_before ± amount = balance_after` é
+verificado. REJECTED e LOSS não geram lançamento.
 
 ## Referências fora de ordem (PENDING_REFERENCE)
 
-REFUND/ROLLBACK cuja referência ainda não existe (ou não está PROCESSED) é
-persistido como `PENDING_REFERENCE` — sem efeito no saldo — e reprocessado pelo
-`PendingReferenceWorker` (cron 10s, `SKIP LOCKED`, lock pessimista por linha,
-revalidação de status dentro da transação). Backoff exponencial de 5s com teto
-de 15min; após 10 tentativas (~45min de TTL) -> `REJECTED` com código de
-referência inexistente (`MissingReference`) e evento no mesmo commit.
-Quando a referência aparece, a movimentação é aplicada com exatamente as
-mesmas regras do fluxo principal (validações de escopo/kind/valor, saldo para
-reversão com `INSUFFICIENT_BALANCE_FOR_REVERSAL` — código distinto do de aposta
-sem saldo, regra 9).
+REFUND/ROLLBACK sem referência existente/PROCESSED persiste como `PENDING_REFERENCE`
+(sem mover saldo) e é reprocessado por worker (cron 10s). Backoff exponencial de 5s
+(teto 15min); após 10 tentativas → `REJECTED / REFERENCE_NOT_FOUND` com evento.
+**Referência terminal (REJECTED/FAILED) é rejeitada imediatamente** — não espera backoff.
 
-Observação: REFUND/ROLLBACK exigem `referenceExternalTransactionId` na
-entrada; referência a si mesmo é rejeitada (`SELF_REFERENCE`). Valor de
-reversão deve ser **igual** ao da referência (`AMOUNT_MISMATCH` se divergir);
-reversão parcial está fora de escopo. Uma referência não pode ser revertida
-duas vezes pelo mesmo tipo (`REFERENCE_ALREADY_REVERTED`).
+A reversão única é garantida em duas camadas: lock pessimista da wallet antes da
+checagem + **índice único parcial** `(provider_id, reference_external_transaction_id, kind)
+WHERE status='PROCESSED'` — a race entre REFUND direto e reprocessamento do worker é
+resolvida pelo schema.
+
+## Schema — garantias no banco (restr. 9)
+
+- `wallets`: `UNIQUE(player_id, currency)`, `CHECK (balance >= 0)`
+- `wallet_ledger`: `UNIQUE(transaction_id)`, CHECKs de direção/valor, **trigger append-only**
+- `wager_transactions`: uniques de idempotência e provider+external, `status varchar(32)`
+  (PENDING_REFERENCE tem 17 chars — bug real encontrado), FKs **deferrables**
+- `inbox_messages`: unique `(consumer_name, message_id)`
+- índices parciais dos workers (pending-reference, outbox pendente, reversão única)
+
+**FKs DEFERRABLE INITIALLY DEFERRED:** o MikroORM insere o batch em lote e não conhece
+a ordem topológica de FKs declaradas sem relations — com deferrable, o Postgres valida
+no COMMIT, ponto em que a UoW inteira já é consistente. (Bug real: insert do ledger
+precedendo o da wallet.)
 
 ## MikroORM e Bun
 
-`@mikro-orm/nestjs` foi descartado: incompatibilidade conhecida com Bun
-(dual-package — o wrapper carrega `@mikro-orm/core` via `require` CJS e os
-prototypes do driver divergem; erro `getORMClass is not a function`). O ORM em
-si é 100% MikroORM (`@mikro-orm/core` + `@mikro-orm/postgresql`); a
-inicialização é manual em `src/config/orm.ts` e o `EntityManager` entra no DI
-do Nest via provider. `em.transactional()` cria um contexto transacional
-isolado por chamada — validado sob 50 chamadas concorrentes sobre o mesmo EM.
+`@mikro-orm/nestjs` descartado: incompatível com Bun (dual-package — `getORMClass is
+not a function`). ORM 100% MikroORM; init manual em `src/config/orm.ts` + provider DI.
+`em.transactional()` cria contexto isolado por chamada — validado sob 50 chamadas
+concorrentes.
 
-O diff do `migration:create` compara entities <-> snapshot
-(`migrations/.snapshot-*.json`); mudanças **só de tamanho de coluna** não são
-sempre detectadas — nesse caso a migration é escrita à mão (foi o caso de
-`status varchar(16) -> varchar(32)`; `PENDING_REFERENCE` tem 17 caracteres).
+**Bug encontrado em carga real (e corrigido):** entidades criadas com `this.em.create()`
+ficavam NEW no Unit of Work do fork singleton e eram re-inseridas (23505) a cada flush
+posterior — mascarado como corrida de idempotência. Correção: entidades são criadas
+apenas no contexto transacional (`em.create` do callback). As unique constraints
+funcionaram como última linha de defesa durante todo o diagnóstico.
 
 ## SQS — classificação de erros
 
-- **Negócio** (transação REJECTED, conflito de idempotência): terminal -> **ack**
-  (o resultado está persistido e auditável).
-- **Transitório** (PG/SQS indisponível, `IdempotencyRaceUnresolvedError`):
-  não deleta — visibility expira -> redelivery com backoff do próprio SQS;
-  `redrive policy` (maxReceiveCount=5) move para a **DLQ** automaticamente.
-- **Permanente** (payload malformado): não é dado ack; as 5 tentativas esgotam
-  e o redrive manda para a DLQ. (Melhoria conhecida: rotear malformados para a
-  DLQ imediatamente checando `ApproximateReceiveCount` na 1ª entrega.)
+- **Negócio** (REJECTED, conflito): terminal → ack (resultado persistido e auditável).
+- **Transitório**: não deleta — visibility expira; redrive policy (5 receives) → DLQ.
+- **Permanente** (malformado): sem ack; esgota as tentativas e o redrive manda pra DLQ.
+- **SIGTERM**: para o loop; mensagens em voo têm visibility zerada em batch.
 
-**SIGTERM:** `onModuleDestroy` para o loop de receive; mensagens recebidas mas
-não processadas têm visibility zerada em batch (`ChangeMessageVisibilityBatch`)
-— nada de in-flight é perdido nem duplicado.
+## Logs, métricas e níveis
 
-## Logs e níveis
+- `INFO`: eventos esperados (processado, replay, duplicata). A taxa de duplicatas é
+  métrica, não volume de log.
+- `WARN`: degradado recuperável (retry de outbox, reprocessamento falho).
+- `ERROR`: terminal, malformado prestes a ir pra DLQ.
+- Logs estruturados com `correlationId`/`messageId`/`walletId`/`providerId`; erros são
+  logados como nome/código (nunca `String(e)` — vaza SQL). 500 não devolve message cru.
+- Métricas em memória em `GET /metrics`: transações por status/kind, duplicatas,
+  replays, outbox published/failed, divergências de reconciliação.
 
-- `INFO` — eventos de negócio **esperados** (processado, replay, rejeição por
-  regra, duplicata resolvida). Duplicata é fluxo normal de entrega
-  at-least-once: WARN aqui treinaria o time a ignorar WARN e poluiria
-  dashboards/alertas (Datadog/Kibana). A taxa é observada por métrica, não por
-  volume de log.
-- `WARN` — degradado mas recuperável (retry de outbox, reprocess falho).
-- `ERROR` — terminal não tratado, malformado prestes a ir pra DLQ.
+## Autenticação (seção 2 — sem pontuação)
 
-Logs estruturados (JSON) com `correlationId`, `messageId`, `transactionId`,
-`walletId`, `providerId`; sem payloads financeiros completos.
-
-## Schema — garantias no banco (restr. 9 do desafio)
-
-- `wallets`: `UNIQUE(player_id, currency)`, `CHECK (balance >= 0)`
-- `wallet_ledger`: `UNIQUE(transaction_id)` (<= 1 lançamento/tx), append-only
-- `wager_transactions`: `UNIQUE(idempotency_key)`,
-  `UNIQUE(provider_id, external_transaction_id)`, `status varchar(32)`
-- `inbox_messages`: PK/unique `(consumer_name, message_id)`
-- `outbox_messages`: `WHERE published_at IS NULL` + índice em `next_attempt_at`
+Ponto de extensão concreto e validado: `JwtAuthGuard` verifica JWT RS256 via JWKS do
+Keycloak (issuer + **azp** — o `aud` de access tokens Keycloak é `account`; `azp` é o
+padrão correto pra client público). Ativado por `AUTH_ENABLED=true` (default false).
+Realm `jungle` auto-importado pelo compose. Health e metrics abertos por requisito.
 
 ## Pegadinhas operacionais documentadas
 
-- **LocalStack isola filas por região** — app, scripts e CLI devem usar a
-  mesma região (`us-east-1`). CLI: `export AWS_DEFAULT_REGION=us-east-1`.
-- **`docker compose up -d --wait`** antes de qualquer comando que dependa de
-  PG/SQS; healthchecks já modelam isso para o serviço `app`.
-- **Volume de dados no serviço certo** — `pgdata` montado em `postgres`, não
-  em `sqs` (erro real cometido durante o desenvolvimento: dados sumiam a cada
-  `down`).
-- **Detecção de erro por string** (`QueueNameExists`) é frágil entre runtimes;
-  o `upsertQueue` cobre os formatos conhecidos do LocalStack/AWS.
+- LocalStack isola filas por região — tudo (`us-east-1`) inclusive CLI.
+- `docker compose up -d --wait` antes de qualquer comando que dependa de PG/SQS.
+- Volume de dados no serviço **postgres** (não no sqs — erro real cometido).
+- Dedup do SQS descarta silenciosamente na janela de 5min.
+- Migrations consolidadas: schema inicial + hardening em migration única.
+
+## Revisão técnica — achados e correções
+
+O projeto passou por revisão externa. Bugs reais encontrados e **corrigidos**:
+
+1. Claim do outbox não era atômico (SKIP LOCKED fora de transação) → claim em um
+   statement com lease + reclaim.
+2. Referência REJECTED pendurava 45min como PENDING_REFERENCE → rejeição imediata.
+3. Race no reprocess (referência já revertida) → ordem de locks + índice único parcial.
+4. Sem enforcement de imutabilidade no schema → trigger append-only.
+5. Outbox retentava pra sempre → esgotamento com park auditável.
+6. 500 com message cru / logs com SQL → sanitização.
+7. Idempotency-Key e amount sem limites → 400 explícito.
 
 ## Limitações conhecidas
 
-- Autenticação não implementada (fora de escopo do desafio) — ponto de
-  extensão nos controllers.
-- Backoff do worker de referência e TTL (~45min) são escolhas razoáveis, não
-  calculadas; um round real de jogo resolve referências em segundos.
-- Métricas: contadores planejados no Lote G (transações por status,
-  duplicatas, DLQ, outbox lag); hoje a observabilidade é por logs.
-- `test-race.ts` cobre concorrência real, mas a suíte formal (`bun test`)
-  ainda será consolidada (Lote F).
+- Autenticação desligada por default (decisão de escopo; guard pronto).
+- Métricas em memória por instância (evolução: Prometheus/OpenTelemetry).
+- Domínio rico (factories/transitions) validado em testes; o caminho quente opera
+  sobre entities do ORM de propósito (Unit of Work transacional) — `applyMovement`
+  em entities seria a evolução natural.
+- REFUND + ROLLBACK da mesma BET é permitido pelo enunciado ("pelo mesmo tipo"); o
+  provedor deve usar ROLLBACK de REFUND para desfazer um refund.

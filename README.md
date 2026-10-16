@@ -1,121 +1,143 @@
-# Wagering Processor — Jungle Gaming Technical Challenge
+# 🦧 Jungle Gaming — Distributed Wagering Processor
 
-Serviço financeiro distribuído que processa transações de apostas (BET, WIN,
-LOSS, REFUND, ROLLBACK) vindas de múltiplos provedores, via HTTP e SQS,
-com garantias de idempotência, concorrência e consistência saldo <-> ledger.
+> Processador financeiro distribuído de apostas (BET · WIN · LOSS · REFUND · ROLLBACK)
+> com idempotência persistente, concorrência por wallet e ledger auditável.
+> **Bun · NestJS · PostgreSQL · SQS (LocalStack) · MikroORM**
 
-## Stack
+[![ci](https://github.com/Caio13Vinni/wagering-processor/actions/workflows/ci.yml/badge.svg)](https://github.com/Caio13Vinni/wagering-processor/actions/workflows/ci.yml)
+![bun](https://img.shields.io/badge/bun-1.x-black?logo=bun)
+![nestjs](https://img.shields.io/badge/NestJS-10-e0234e?logo=nestjs&logoColor=white)
+![postgres](https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white)
+![sqs](https://img.shields.io/badge/SQS-LocalStack-ff9900?logo=amazon-aws&logoColor=white)
+![tests](https://img.shields.io/badge/tests-27%2F27-brightgreen)
+![money](https://img.shields.io/badge/money-decimal%20only-blue)
 
-| Item | Escolha |
-|---|---|
-| Runtime / package manager / test runner | Bun 1.x |
-| Linguagem | TypeScript (strict) |
-| Framework | NestJS |
-| ORM | MikroORM (inicialização manual — ver ARCHITECTURE.md) |
-| Banco | PostgreSQL 16 |
-| Mensageria | AWS SQS via LocalStack |
-| Orquestração | Docker Compose |
-| Migrations | MikroORM Migrator (versionadas, reversíveis) |
+---
 
-## Pré-requisitos
+## 🧠 Arquitetura
 
-- Bun 1.x
-- Docker + Docker Compose
-- aws-cli (apenas para comandos manuais de fila — opcional)
+```mermaid
+flowchart LR
+  subgraph Entrada
+    HTTP[HTTP API<br/>REST] --> UC
+    SQS[[SQS FIFO<br/>wager-transactions.fifo]] --> C[SqsConsumer<br/>inbox dedup]
+    C --> UC
+  end
+  UC[SubmitWagerTransactionUseCase<br/>lock pessimista por wallet]
+  subgraph PostgreSQL[(PostgreSQL)]
+    W[wallets<br/>saldo + version<br/>CHECK balance >= 0]
+    L[(wallet_ledger<br/>append-only · trigger)]
+    T[wager_transactions<br/>idempotência + status]
+    IN[inbox_messages]
+    OUT[outbox_messages<br/>eventos atômicos]
+  end
+  UC --> W & L & T & IN & OUT
+  OUT --> P[OutboxPublisherWorker<br/>claim atômico SKIP LOCKED]
+  P --> EV[[wager-events.fifo]]
+  T -.->|PENDING_REFERENCE| PRW[PendingReferenceWorker<br/>cron 10s + backoff]
+  PRW --> UC
+  DLQ[[wager-transactions-dlq.fifo]] -.redrive 5x.-> SQS
+```
 
-## Setup
+**Invariantes no schema** (não só no código): `CHECK (balance >= 0)` · ledger imutável via trigger ·
+≤ 1 lançamento por transação · reversão única por tipo (índice único parcial) · FKs deferrables.
+
+## 🚀 Quickstart
 
 ```bash
-git clone <repo> && cd wagering-processor
+git clone https://github.com/Caio13Vinni/wagering-processor && cd wagering-processor
 bun install
 
-# 1. sobe PostgreSQL e LocalStack (aguarda healthy)
-docker compose up -d --wait postgres sqs
-
-# 2. cria as filas (idempotente — pode rodar quantas vezes quiser)
-bun run setup:queues
-
-# 3. aplica as migrations (schema completo + ajustes)
-bun run migration:up
-
-# 4. sobe a API (porta 3000) — consumer SQS e workers entram junto
-bun run start
+docker compose up -d --wait          # postgres + localstack + keycloak
+bun run migration:up                 # schema consolidado (1 migration)
+bun run setup:queues                 # filas (idempotente)
+bun run start                        # API :3000 + consumer + workers
 ```
 
-Alternativa full-container (app também em container):
+Ou full-container: `docker compose up -d --wait` (o `app` roda migrations ao subir).
 
 ```bash
-docker compose up -d --wait
+curl localhost:3000/health/ready
+# {"status":"ready","checks":{"database":"up","sqs":"up"}}
 ```
 
-## Health checks (sem autenticação)
+## 🔁 Garantias (o que o sistema sobrevive)
 
-```bash
-curl localhost:3000/health/live    # processo vivo
-curl localhost:3000/health/ready   # PostgreSQL + SQS alcançáveis
-```
-
-## API — exemplos rápidos
-
-```bash
-# criar wallet (repetir = 409)
-curl -X POST localhost:3000/wallets -H 'content-type: application/json' -d '{
-  "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
-  "initialBalance": { "amount": "100.00", "currency": "BRL" }
-}'
-
-# submeter transação (Idempotency-Key obrigatório)
-curl -X POST localhost:3000/wagering/transactions \
-  -H 'content-type: application/json' \
-  -H 'Idempotency-Key: provider-a:transaction-123' -d '{
-  "providerId": "provider-a",
-  "externalTransactionId": "transaction-123",
-  "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
-  "walletId": "<id-da-wallet>",
-  "roundId": "round-987",
-  "gameId": "fortune-chimp",
-  "kind": "BET",
-  "money": { "amount": "25.00", "currency": "BRL" }
-}'
-
-# consultas
-curl localhost:3000/wallets/<walletId>
-curl "localhost:3000/wallets/<walletId>/ledger?limit=50"
-curl localhost:3000/wagering/transactions/<transactionId>
-curl localhost:3000/providers/<providerId>/wagering/transactions/<externalTransactionId>
-
-# reconciliação (saldo materializado vs Soma ledger — nunca corrige silenciosamente)
-curl -X POST localhost:3000/wallets/<walletId>/reconciliation
-```
-
-**Mapeamento de status HTTP:** 201 processado | 200 replay | 202 pendente |
-400 payload inválido | 409 conflito (idempotência/wallet duplicada) |
-422 rejeitado por regra de negócio | 503 falha transitória de infraestrutura.
-
-## Filas
-
-| Fila | Função |
+| Cenário | Garantia |
 |---|---|
-| `wager-transactions.fifo` | entrada de operações dos provedores |
-| `wager-transactions-dlq.fifo` | redrive automático após 5 receives sem ack |
-| `wager-events.fifo` | eventos de integração publicados pelo outbox |
+| Mesma mensagem/redelivery N× | inbox persistente + idempotency-key → replay com o **saldo original** |
+| Corrida na idempotency-key | unique constraint decide; 3 desfechos: replay / **409** / 503 transitório |
+| 50 apostas paralelas, mesma key | exatamente **1 débito** (testado) |
+| Duas apostas disputando o saldo | lock pessimista por wallet + version + `CHECK balance >= 0` |
+| REFUND chega antes da BET | `PENDING_REFERENCE` → worker resolve sozinho em ~15s |
+| Referência rejeitada pelo provedor | rejeição **imediata** (`REFERENCE_NOT_PROCESSED`), sem esperar backoff |
+| Processo morre pós-commit | outbox + visibility timeout — nada perdido, nada duplicado |
+| SQL manual malicioso | ledger **append-only por trigger** — nem UPDATE passa |
 
-## Scripts úteis
+## 📊 Qualidade
+
+| Verificação | Resultado |
+|---|---|
+| Testes (`bun test`) | **27/27** — unit + integração real + concorrência real |
+| Typecheck strict | `tsc --noEmit` ✅ (job do CI) |
+| CI | 4 jobs: quality · test (Postgres real) · docker build · smoke (stack no ar) |
+| Carga (`bun run test:load`) | 500 BETs · 25 concorrentes · **94 rps** · p50 136ms / p95 272ms · **0 erros** |
+| Invariante pós-carga | `balance == Σ ledger` consistente |
+
+## 🌐 API
+
+| Endpoint | Descrição |
+|---|---|
+| `POST /wallets` | cria wallet (409 se duplicada; opening credit no ledger) |
+| `GET /wallets/:id` · `GET /wallets/:id/ledger?cursor=&limit=` | consultas (cursor opaco estável) |
+| `POST /wallets/:id/reconciliation` | saldo vs Σ ledger — **nunca corrige silenciosamente** |
+| `POST /wagering/transactions` | submete operação — header `Idempotency-Key` obrigatório |
+| `GET /wagering/transactions/:id` · `GET /providers/:p/wagering/transactions/:ext` | consultas |
+| `GET /health/live` · `GET /health/ready` · `GET /metrics` | sem autenticação |
+
+**Status HTTP:** `201` processado · `200` replay · `202` pendente · `400` payload ·
+`409` conflito · `422` regra de negócio · `503` transitório.
+
+## 🔐 Autenticação (ponto de extensão)
+
+Keycloak sobe com o realm `jungle` **auto-importado** (`keycloak/jungle-realm.json`):
+client `wagering-api` (public), user `player1` / `senha123`, console `admin/admin`.
 
 ```bash
-bun run setup:queues      # cria/atualiza filas (idempotente)
-bun run migration:up      # aplica migrations pendentes
-bun run migration:create  # gera migration a partir do diff entities<->snapshot
-bun scripts/test-race.ts  # teste de corrida de idempotência (2 e 50 concorrentes)
+AUTH_ENABLED=true bun run start   # default false — guard JWT valida issuer + azp via JWKS
 ```
 
-## Autenticação
+Health e metrics permanecem abertos por requisito do desafio.
 
-Não implementada por escopo (não pontua no desafio). Mensagens de fila são
-canal interno confiável; a identidade do provedor na mensagem é validada por
-regras de domínio (escopo de referência, unicidade provider+external, etc.).
-O ponto de extensão são os controllers (`WalletController`, `WageringController`)
-— um guard de JWT/OIDC (Keycloak, Zitadel) plugaria ali sem tocar no domínio.
-Health checks ficam abertos por requisito.
+## 🧪 Scripts
 
-Veja `ARCHITECTURE.md` para decisões, trade-offs e limitações.
+```bash
+bun test                 # suíte completa (precisa do postgres no ar)
+bun run test:load        # teste de carga + relatório (p50/p95/p99, throughput, invariante)
+bun run migration:up     # aplica migrations
+bun run setup:queues     # cria/atualiza filas (idempotente)
+```
+
+## 📚 Documentação
+
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — decisões, trade-offs, bugs encontrados em carga real e correções
+- [`keycloak/jungle-realm.json`](./keycloak/jungle-realm.json) — realm auto-importado
+
+## 🗂️ Estrutura
+
+```
+src/
+├── application/        # use cases (execute + reprocess)
+├── domain/             # money, wallet, ledger, transactions (@Check nas entities)
+├── infrastructure/
+│   ├── http/           # controllers + exception filter + DTOs
+│   ├── sqs/            # consumer (inbox, ack pós-commit, DLQ, SIGTERM)
+│   ├── metrics/        # contadores/gauges rotulados
+│   └── auth/           # JwtAuthGuard (JWKS, azp) — flag AUTH_ENABLED
+├── workers/            # outbox publisher (claim atômico) + pending-reference
+└── config/             # env, mikro-orm (init manual — Bun), orm
+test/
+├── unit/               # Money
+├── integration/        # regras de wagering, idempotência (Postgres real)
+└── concurrency/        # hot wallet: 2×80 e 50× paralelo reais
+```
