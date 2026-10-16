@@ -24,17 +24,6 @@ Fluxo completo em 8 passos: envio da aposta → idempotência + lock pessimista 
 replay com saldo original → corrida de saldo (2× BET 80) → evento do outbox → REFUND fora de
 ordem resolvido pelo worker de `PENDING_REFERENCE`.
 
-> O diagrama é gerado com [Brainagram](https://github.com/LucasNasc/brainagram) a partir do
-> arquivo-fonte [`docs/fluxo-bet.brain`](./docs/fluxo-bet.brain) (texto versionado — diffs de
-> fluxo aparecem no PR). Para regenerar o GIF:
->
-> ```bash
-> git clone https://github.com/LucasNasc/brainagram.git && cd brainagram
-> cp .env.example .env && docker compose up -d
-> sed -i "s/SECRET_KEY_BASE=.*/SECRET_KEY_BASE=$(openssl rand -hex 64)/" .env
-> docker compose up -d
-> # importe docs/fluxo-bet.brain e exporte o GIF animado para docs/fluxo-bet.gif
-> ```
 
 ```mermaid
 flowchart LR
