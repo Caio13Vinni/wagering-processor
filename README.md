@@ -16,21 +16,6 @@
 
 ## 🧠 Arquitetura
 
-### ▶️ Diagrama animado — a história de uma aposta
-
-Este repositório inclui um diagrama de sequência **animado** em [Brainagram](https://github.com/LucasNasc/brainagram)
-(arquivo [`docs/fluxo-bet.brain`](./docs/fluxo-bet.brain) — texto é a fonte, versionado no repo):
-
-```bash
-# suba o brainagram e dê play no fluxo
-git clone https://github.com/LucasNasc/brainagram.git && cd brainagram
-cp .env.example .env && docker compose up -d
-# abra o editor e importe docs/fluxo-bet.brain
-```
-
-Os passos tocam em ordem: envio da aposta → idempotência + lock → commit atômico →
-replay → corrida de saldo → evento do outbox → REFUND fora de ordem resolvido pelo worker.
-
 ```mermaid
 flowchart LR
   subgraph Entrada
@@ -40,8 +25,8 @@ flowchart LR
   end
   UC[SubmitWagerTransactionUseCase<br/>lock pessimista por wallet]
   subgraph PostgreSQL[(PostgreSQL)]
-    W[wallets<br/>saldo + version]
-    L[(wallet_ledger<br/>append-only, trigger)]
+    W[wallets<br/>saldo + version<br/>CHECK balance >= 0]
+    L[(wallet_ledger<br/>append-only · trigger)]
     T[wager_transactions<br/>idempotência + status]
     IN[inbox_messages]
     OUT[outbox_messages<br/>eventos atômicos]
@@ -51,12 +36,11 @@ flowchart LR
   P --> EV[[wager-events.fifo]]
   T -.->|PENDING_REFERENCE| PRW[PendingReferenceWorker<br/>cron 10s + backoff]
   PRW --> UC
-  W -.->|CHECK balance >= 0| W
   DLQ[[wager-transactions-dlq.fifo]] -.redrive 5x.-> SQS
 ```
 
 **Invariantes no schema** (não só no código): `CHECK (balance >= 0)` · ledger imutável via trigger ·
-≤ 1 lançamento por transação · reversão única por tipo (índice único parcial).
+≤ 1 lançamento por transação · reversão única por tipo (índice único parcial) · FKs deferrables.
 
 ## 🚀 Quickstart
 
@@ -86,8 +70,8 @@ curl localhost:3000/health/ready
 | 50 apostas paralelas, mesma key | exatamente **1 débito** (testado) |
 | Duas apostas disputando o saldo | lock pessimista por wallet + version + `CHECK balance >= 0` |
 | REFUND chega antes da BET | `PENDING_REFERENCE` → worker resolve sozinho em ~15s |
+| Referência rejeitada pelo provedor | rejeição **imediata** (`REFERENCE_NOT_PROCESSED`), sem esperar backoff |
 | Processo morre pós-commit | outbox + visibility timeout — nada perdido, nada duplicado |
-| Referência REJECTED | rejeição imediata (não espera 45min de backoff) |
 | SQL manual malicioso | ledger **append-only por trigger** — nem UPDATE passa |
 
 ## 📊 Qualidade
@@ -136,7 +120,7 @@ bun run setup:queues     # cria/atualiza filas (idempotente)
 
 ## 📚 Documentação
 
-- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — decisões, trade-offs, o bug de UoW do MikroORM, FKs deferrables, revisão técnica e correções
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — decisões, trade-offs, bugs encontrados em carga real e correções
 - [`keycloak/jungle-realm.json`](./keycloak/jungle-realm.json) — realm auto-importado
 
 ## 🗂️ Estrutura
@@ -144,7 +128,7 @@ bun run setup:queues     # cria/atualiza filas (idempotente)
 ```
 src/
 ├── application/        # use cases (execute + reprocess)
-├── domain/             # money, wallet, ledger, transactions (CHECKs via @Check)
+├── domain/             # money, wallet, ledger, transactions (@Check nas entities)
 ├── infrastructure/
 │   ├── http/           # controllers + exception filter + DTOs
 │   ├── sqs/            # consumer (inbox, ack pós-commit, DLQ, SIGTERM)
