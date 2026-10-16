@@ -1,9 +1,10 @@
-import { Entity, Index, PrimaryKey, Property, Unique } from '@mikro-orm/core';
+import { Check, Entity, Index, PrimaryKey, Property, Unique } from '@mikro-orm/core';
 import { randomUUID } from 'node:crypto';
 
 @Entity({ tableName: 'wager_transactions' })
 @Unique({ properties: ['idempotencyKey'] })
 @Unique({ properties: ['providerId', 'externalTransactionId'] })
+@Check({ name: 'chk_tx_amount', expression: 'amount >= 0' })
 export class WagerTransactionEntity {
   @PrimaryKey({ type: 'uuid' })
   id: string = randomUUID();
@@ -15,7 +16,7 @@ export class WagerTransactionEntity {
   @Property({ length: 128 })
   externalTransactionId!: string;
 
-  /** Fonte da verdade da idempotência. */
+  /** Fonte da verdade da idempotencia. */
   @Property({ length: 255 })
   idempotencyKey!: string;
 
@@ -34,7 +35,7 @@ export class WagerTransactionEntity {
   @Property({ length: 128 })
   gameId!: string;
 
-  @Property({ length: 16 })
+  @Property({ length: 32 })
   kind!: string;
 
   @Property({ type: 'decimal', precision: 19, scale: 2 })
@@ -43,7 +44,7 @@ export class WagerTransactionEntity {
   @Property({ type: 'char', length: 3 })
   currency!: string;
 
-  /** Id no provedor da transação referenciada (não o id interno). */
+  /** Id no provedor da transacao referenciada (nao o id interno). */
   @Property({ length: 128, nullable: true })
   referenceExternalTransactionId?: string;
 
@@ -56,6 +57,11 @@ export class WagerTransactionEntity {
   @Property({ length: 48, nullable: true })
   failureCode?: string;
 
+  /**
+   * Saldo observado logo apos o processamento (regra 7).
+   * NULL para REJECTED/FAILED/PENDING_REFERENCE e LOSS — replay so responde
+   * saldo para transacoes que o moveram.
+   */
   @Property({ type: 'decimal', precision: 19, scale: 2, nullable: true })
   resultingBalance?: string;
 

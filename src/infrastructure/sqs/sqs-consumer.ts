@@ -41,7 +41,7 @@ export class SqsConsumer implements OnModuleInit, OnModuleDestroy {
   private readonly sqs = createSqsClient();
   private running = false;
   private loggedQueueMissing = false;
-  /** Receipt handles recebidos mas ainda não acked (para SIGTERM). */
+  /** Receipt handles recebidos mas ainda nao acked (para SIGTERM). */
   private readonly inFlight = new Set<string>();
 
   constructor(private readonly submit: SubmitWagerTransactionUseCase) {}
@@ -52,8 +52,8 @@ export class SqsConsumer implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * SIGTERM: para o loop; mensagens em andamento DEVOLVIDAS (visibility 0) —
-   * o processamento atual conclui e acka normalmente antes do exit.
+   * SIGTERM: para o loop; mensagens recebidas mas nao processadas DEVOLVIDAS
+   * (visibility 0) — o processamento atual conclui e acka normalmente antes do exit.
    */
   async onModuleDestroy(): Promise<void> {
     this.running = false;
@@ -91,7 +91,7 @@ export class SqsConsumer implements OnModuleInit, OnModuleDestroy {
           const msg = String(e);
           const queueMissing = msg.includes('Expecting value') || msg.includes('QueueDoesNotExist');
           if (queueMissing) {
-            // fila ausente = problema de setup, não de runtime: loga 1x e espera mais
+            // fila ausente = problema de setup, nao de runtime: loga 1x e espera mais
             if (!this.loggedQueueMissing) {
               this.loggedQueueMissing = true;
               this.logger.error({
@@ -101,7 +101,7 @@ export class SqsConsumer implements OnModuleInit, OnModuleDestroy {
             }
           } else {
             this.loggedQueueMissing = false;
-            this.logger.warn({ msg: 'receive failed, retrying', error: msg });
+            this.logger.warn({ msg: 'receive failed, retrying', error: errName(e) });
           }
           await new Promise((r) => setTimeout(r, queueMissing ? 10_000 : 1_000));
         }
@@ -123,44 +123,43 @@ export class SqsConsumer implements OnModuleInit, OnModuleDestroy {
           msg: 'malformed message',
           receiveCount,
           willDlq: receiveCount >= MAX_RECEIVE_COUNT,
-          body: truncate(msg.Body),
         });
         return;
       }
 
-      // MESMO use case da entrada HTTP — regras, idempotência e inbox idênticos
+      // MESMO use case da entrada HTTP — regras, idempotencia e inbox identicos
       await this.submit.execute(envelope.data, envelope.data.idempotencyKey, {
         channel: 'sqs',
         messageId: envelope.messageId,
         consumerName: CONSUMER_NAME,
       });
 
-      // ack SOMENTE após commit (execute só retorna depois do commit)
+      // ack SOMENTE apos commit (execute so retorna depois do commit)
       await this.sqs.send(new DeleteMessageCommand({
         QueueUrl: queueUrl(QUEUES.WAGER_TRANSACTIONS),
         ReceiptHandle: receiptHandle,
       }));
     } catch (e) {
       if (e instanceof IdempotencyConflictError) {
-        // terminal de negócio: provider+external com payload divergente.
-        // A transação original já está persistida — ack.
+        // terminal de negocio: provider+external com payload divergente.
+        // A transacao original ja esta persistida — ack.
         this.logger.warn({ msg: 'business conflict, acking', error: e.message });
         await this.sqs.send(new DeleteMessageCommand({
           QueueUrl: queueUrl(QUEUES.WAGER_TRANSACTIONS),
           ReceiptHandle: receiptHandle,
         }));
       } else if (e instanceof IdempotencyRaceUnresolvedError) {
-        // transitório: NÃO deleta — visibility expira e SQS redelivera.
-        // redrive policy garante DLQ após MAX_RECEIVE_COUNT receives.
+        // transitorio: NAO deleta — visibility expira e SQS redelivera.
+        // redrive policy garante DLQ apos MAX_RECEIVE_COUNT receives.
         this.logger.warn({
           msg: 'transient failure, message will be retried',
           receiveCount,
           willDlq: receiveCount >= MAX_RECEIVE_COUNT,
-          error: String(e),
+          error: errName(e),
         });
       } else {
-        // desconhecido: trata como transitório (mais seguro que perder mensagem)
-        this.logger.error({ msg: 'unexpected error, message will be retried', error: String(e) });
+        // desconhecido: trata como transitorio (mais seguro que perder mensagem)
+        this.logger.error({ msg: 'unexpected error, message will be retried', error: errName(e) });
       }
     } finally {
       this.inFlight.delete(receiptHandle);
@@ -173,7 +172,7 @@ export class SqsConsumer implements OnModuleInit, OnModuleDestroy {
       const d = parsed?.data;
       const valid = parsed?.messageId && d?.providerId && d?.externalTransactionId &&
         d?.idempotencyKey && d?.playerId && d?.walletId && d?.kind && d?.money?.amount &&
-        (VALID_KINDS as readonly string[]).includes(d.kind); // rejeita kind inválido
+        (VALID_KINDS as readonly string[]).includes(d.kind); // rejeita kind invalido
       return valid ? parsed : null;
     } catch {
       return null;
@@ -190,6 +189,12 @@ export class SqsConsumer implements OnModuleInit, OnModuleDestroy {
       Entries: entries,
     })).catch(() => undefined);
   }
+}
+
+/** Nome/codigo do erro SEM vazar SQL/valores nos logs. */
+function errName(e: unknown): string {
+  const err = e as { code?: string; name?: string };
+  return err?.code ? `${err.name ?? 'Error'}(${err.code})` : (err?.name ?? 'Error');
 }
 
 function truncate(s: string | undefined, n = 200): string {

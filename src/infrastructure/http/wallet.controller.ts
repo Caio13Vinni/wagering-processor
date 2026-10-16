@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body, Controller, Get, HttpCode, HttpStatus, NotFoundException, Param, ParseIntPipe, ParseUUIDPipe, Post, Query,
 } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
@@ -6,8 +7,8 @@ import Decimal from 'decimal.js';
 import { CreateWalletUseCase } from '../../application/create-wallet.use-case';
 import { WalletEntity } from '../../domain/wallet/wallet.entity';
 import { WalletLedgerEntryEntity } from '../../domain/ledger/ledger-entry.entity';
-import { CreateWalletDto } from './dto';
 import { metrics } from '../metrics/metrics';
+import { CreateWalletDto } from './dto';
 
 @Controller('wallets')
 export class WalletController {
@@ -44,8 +45,8 @@ export class WalletController {
   }
 
   /**
-   * Ledger com cursor opaco e estável: base64 de `${createdAt ISO}|${id}`.
-   * ordenação (created_at, id) — id desempata entradas no mesmo timestamp.
+   * Ledger com cursor opaco e estavel: base64 de `${createdAt ISO}|${id}`.
+   * ordenacao (created_at, id) — id desempata entradas no mesmo timestamp.
    */
   @Get(':walletId/ledger')
   async ledger(
@@ -60,8 +61,17 @@ export class WalletController {
 
     const where: Record<string, unknown> = { walletId };
     if (cursor) {
-      const [iso, id] = Buffer.from(cursor, 'base64').toString('utf8').split('|');
-      // comparacao lexica de tupla via OR — id desempata
+      // cursor malformado = 400 (era 500 quebrando a query antes)
+      let iso: string;
+      let id: string;
+      try {
+        const parts = Buffer.from(cursor, 'base64').toString('utf8').split('|');
+        iso = parts[0];
+        id = parts[1];
+        if (!id || isNaN(new Date(iso).getTime())) throw new Error('bad cursor');
+      } catch {
+        throw new BadRequestException('invalid cursor');
+      }
       where.$or = [
         { createdAt: { $gt: new Date(iso) } },
         { createdAt: new Date(iso), id: { $gt: id } },
@@ -96,8 +106,8 @@ export class WalletController {
   }
 
   /**
-   * Reconciliação: saldo materializado vs Σ ledger. Divergência NUNCA é
-   * corrigida silenciosamente — sinalizada na resposta e logada.
+   * Reconciliacao: saldo materializado vs Σ ledger. Divergencia NUNCA e
+   * corrigida silenciosamente — sinalizada na resposta, logada e metricada.
    */
   @Post(':walletId/reconciliation')
   @HttpCode(HttpStatus.OK)

@@ -285,6 +285,17 @@
       "indexes": [
         {
           "columnNames": [
+            "next_attempt_at"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "ix_outbox_pending",
+          "unique": false,
+          "primary": false,
+          "expression": "CREATE INDEX ix_outbox_pending ON public.outbox_messages USING btree (next_attempt_at) WHERE (published_at IS NULL)"
+        },
+        {
+          "columnNames": [
             "lease_owner"
           ],
           "composite": false,
@@ -457,13 +468,13 @@
         },
         "kind": {
           "name": "kind",
-          "type": "varchar(16)",
+          "type": "varchar(32)",
           "unsigned": false,
           "autoincrement": false,
           "primary": false,
           "nullable": false,
           "unique": false,
-          "length": 16,
+          "length": 32,
           "precision": null,
           "scale": null,
           "default": null,
@@ -653,6 +664,31 @@
       "indexes": [
         {
           "columnNames": [
+            "status",
+            "next_attempt_at"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "ix_wager_pending",
+          "unique": false,
+          "primary": false,
+          "expression": "CREATE INDEX ix_wager_pending ON public.wager_transactions USING btree (status, next_attempt_at) WHERE ((status)::text = 'PENDING_REFERENCE'::text)"
+        },
+        {
+          "columnNames": [
+            "provider_id",
+            "reference_external_transaction_id",
+            "kind"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "ux_wager_reversal_once",
+          "unique": true,
+          "primary": false,
+          "expression": "CREATE UNIQUE INDEX ux_wager_reversal_once ON public.wager_transactions USING btree (provider_id, reference_external_transaction_id, kind) WHERE (((status)::text = 'PROCESSED'::text) AND (reference_external_transaction_id IS NOT NULL))"
+        },
+        {
+          "columnNames": [
             "idempotency_key"
           ],
           "composite": false,
@@ -713,8 +749,44 @@
           "primary": false
         }
       ],
-      "checks": [],
-      "foreignKeys": {},
+      "checks": [
+        {
+          "name": "chk_tx_amount",
+          "columnName": "amount",
+          "definition": "CHECK ((amount >= (0)::numeric))",
+          "expression": "amount >= 0"
+        }
+      ],
+      "foreignKeys": {
+        "fk_tx_reference": {
+          "columnNames": [
+            "reference_transaction_id"
+          ],
+          "constraintName": "fk_tx_reference",
+          "localTableName": "public.wager_transactions",
+          "referencedTableName": "public.wager_transactions",
+          "referencedColumnNames": [
+            "id"
+          ],
+          "updateRule": "no action",
+          "deleteRule": "no action",
+          "deferMode": "deferred"
+        },
+        "fk_tx_wallet": {
+          "columnNames": [
+            "wallet_id"
+          ],
+          "constraintName": "fk_tx_wallet",
+          "localTableName": "public.wager_transactions",
+          "referencedTableName": "public.wallets",
+          "referencedColumnNames": [
+            "id"
+          ],
+          "updateRule": "no action",
+          "deleteRule": "no action",
+          "deferMode": "deferred"
+        }
+      },
       "nativeEnums": {},
       "comment": null
     },
@@ -781,8 +853,11 @@
           "scale": null,
           "default": null,
           "comment": null,
-          "enumItems": [],
-          "mappedType": "string"
+          "enumItems": [
+            "DEBIT",
+            "CREDIT"
+          ],
+          "mappedType": "enum"
         },
         "amount": {
           "name": "amount",
@@ -899,8 +974,30 @@
           "primary": false
         }
       ],
-      "checks": [],
-      "foreignKeys": {},
+      "checks": [
+        {
+          "name": "chk_ledger_amount",
+          "columnName": "amount",
+          "definition": "CHECK ((amount > (0)::numeric))",
+          "expression": "amount > 0"
+        }
+      ],
+      "foreignKeys": {
+        "fk_ledger_wallet": {
+          "columnNames": [
+            "wallet_id"
+          ],
+          "constraintName": "fk_ledger_wallet",
+          "localTableName": "public.wallet_ledger",
+          "referencedTableName": "public.wallets",
+          "referencedColumnNames": [
+            "id"
+          ],
+          "updateRule": "no action",
+          "deleteRule": "no action",
+          "deferMode": "deferred"
+        }
+      },
       "nativeEnums": {},
       "comment": null
     },

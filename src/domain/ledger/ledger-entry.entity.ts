@@ -1,8 +1,10 @@
-import { Entity, PrimaryKey, Property, Unique } from '@mikro-orm/core';
+import { Check, Entity, PrimaryKey, Property, Unique } from '@mikro-orm/core';
 import { randomUUID } from 'node:crypto';
 
 @Entity({ tableName: 'wallet_ledger' })
 @Unique({ properties: ['transactionId'] })
+@Check({ name: 'chk_ledger_direction', expression: "direction in ('DEBIT', 'CREDIT')" })
+@Check({ name: 'chk_ledger_amount', expression: 'amount > 0' })
 export class WalletLedgerEntryEntity {
   @PrimaryKey({ type: 'uuid' })
   id: string = randomUUID();
@@ -10,11 +12,11 @@ export class WalletLedgerEntryEntity {
   @Property({ type: 'uuid', index: true })
   walletId!: string;
 
-  /** Garante ≤ 1 lançamento por transação financeira. */
+  /** Garante ≤ 1 lancamento por transacao financeira. */
   @Property({ type: 'uuid' })
   transactionId!: string;
 
-  // 'DEBIT' | 'CREDIT' — varchar(6): varchar(6) paddeia 'DEBIT ' e quebra filtros SQL
+  // 'DEBIT' | 'CREDIT' — varchar(6): char(6) paddeia 'DEBIT ' e quebra filtros SQL
   @Property({ type: 'varchar', length: 6 })
   direction!: string;
 
