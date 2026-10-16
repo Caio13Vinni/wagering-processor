@@ -1,13 +1,9 @@
 /**
- * scripts/test-race.ts — testa a corrida de idempotência (Bug 1)
+ * scripts/test-race.ts — testa a corrida de idempotência (Bug 1) e o replay com saldo original (Bug 2)
  * Pré-requisito: docker compose up -d postgres && bun run migration:up
- *
- * Esperado com o fix aplicado:
- *   race-2:  ✅ 1 PROCESSED + 1 replay
- *   race-50: ✅ 1 PROCESSED + 49 replays
- *   ledger:  ✅ 1 CREDIT (opening) + 2 DEBIT
- *   saldo:   ✅ 50.00
  */
+import { Logger } from '@nestjs/common';
+Logger.overrideLogger(['error']);
 import { randomUUID } from 'node:crypto';
 import { MikroORM } from '@mikro-orm/postgresql';
 import config from '../src/config/mikro-orm.config';
@@ -48,7 +44,7 @@ function makeBet(n: number) {
   };
 }
 
-// ---- teste 1: corrida de 2 na mesma key ----
+// ---- teste 1: corrida de 2 na mesma key + replay com saldo ORIGINAL (regra 7) ----
 {
   const { payload, key } = makeBet(1);
   const submit = () => useCase.execute({ ...payload }, key, { channel: 'http' });
@@ -57,6 +53,13 @@ function makeBet(n: number) {
   const ok = flags === 'false,true';
   console.log(`race-2:  ${ok ? '✅ PASS' : `❌ FAIL (${flags})`}`,
     { a: `${a.status}/replay=${a.idempotentReplay}`, b: `${b.status}/replay=${b.idempotentReplay}` });
+
+  // regra 7: replay da bet-1 DEPOIS que ela já foi processada
+  // deve responder o saldo ORIGINAL observado no processamento (75.00)
+  const replay = await useCase.execute({ ...payload }, key, { channel: 'http' });
+  const replayOk = replay.idempotentReplay === true && replay.balance?.amount === '75.00';
+  console.log(`replay-saldo-original: ${replayOk ? '✅ PASS (75.00)' : `❌ FAIL (${JSON.stringify(replay.balance)})`}`);
+  if (!replayOk) process.exitCode = 1;
 }
 
 // ---- teste 2: 50× paralelo com key NOVA (cenário da seção 13) ----
@@ -70,13 +73,13 @@ function makeBet(n: number) {
   const failures = results.filter((r) => !r.idempotentReplay && r.status !== 'PROCESSED').length;
   const ok = processed === 1 && replays === 49 && failures === 0;
   console.log(`race-50: ${ok ? '✅ PASS (1 processed, 49 replays, 0 erros)' : `❌ FAIL (${processed} processed, ${replays} replays, ${failures} outros)`}`);
+  if (!ok) process.exitCode = 1;
 }
 
 // ---- confere no banco ----
 const rows = (await em.getConnection().execute(
   `select direction, count(*)::int as n from wallet_ledger where wallet_id = '${walletId}' group by direction`,
 )) as Array<{ direction: string; n: number }>;
-// trim() por causa do char(6): 'DEBIT ' (padded). Remover após a migration char→varchar.
 const count = (dir: string) => rows.find((r) => r.direction.trim() === dir)?.n ?? 0;
 
 const walletRows = (await em.getConnection().execute(
@@ -90,6 +93,7 @@ const balanceOk = balance === '50.00';    // 100 - 25 - 25
 
 console.log(`ledger:  ${creditOk && debitOk ? '✅ 1 CREDIT (opening) + 2 DEBIT' : `❌ ${JSON.stringify(rows)}`}`);
 console.log(`saldo:   ${balanceOk ? '✅ 50.00' : `❌ ${balance}`}`);
+if (!(creditOk && debitOk && balanceOk)) process.exitCode = 1;
 
 await orm.close();
-process.exit(creditOk && debitOk && balanceOk ? 0 : 1);
+process.exit(process.exitCode ?? 0);

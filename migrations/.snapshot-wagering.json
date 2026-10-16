@@ -565,6 +565,22 @@
           "enumItems": [],
           "mappedType": "string"
         },
+        "resulting_balance": {
+          "name": "resulting_balance",
+          "type": "numeric(19,2)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": 19,
+          "scale": 2,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "decimal"
+        },
         "attempts": {
           "name": "attempts",
           "type": "int",
@@ -901,7 +917,7 @@
         },
         "direction": {
           "name": "direction",
-          "type": "char(6)",
+          "type": "varchar(6)",
           "unsigned": false,
           "autoincrement": false,
           "primary": false,
@@ -913,7 +929,7 @@
           "default": null,
           "comment": null,
           "enumItems": [],
-          "mappedType": "character"
+          "mappedType": "string"
         },
         "amount": {
           "name": "amount",
