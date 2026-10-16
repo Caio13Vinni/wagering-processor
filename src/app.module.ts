@@ -11,6 +11,7 @@ import { HealthController } from './infrastructure/http/health.controller';
 import { DomainExceptionFilter } from './infrastructure/http/domain-exception.filter';
 import { SqsConsumer } from './infrastructure/sqs/sqs-consumer';
 import { OutboxPublisherWorker } from './workers/outbox-publisher.worker';
+import { PendingReferenceWorker } from './workers/pending-reference.worker';
 
 @Module({
   imports: [ScheduleModule.forRoot()],
@@ -21,6 +22,7 @@ import { OutboxPublisherWorker } from './workers/outbox-publisher.worker';
     SubmitWagerTransactionUseCase,
     SqsConsumer,
     OutboxPublisherWorker,
+    PendingReferenceWorker,
     { provide: APP_FILTER, useClass: DomainExceptionFilter },
   ],
 })

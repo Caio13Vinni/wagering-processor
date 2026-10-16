@@ -40,6 +40,7 @@ export class SqsConsumer implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(SqsConsumer.name);
   private readonly sqs = createSqsClient();
   private running = false;
+  private loggedQueueMissing = false;
   /** Receipt handles recebidos mas ainda não acked (para SIGTERM). */
   private readonly inFlight = new Set<string>();
 
@@ -89,8 +90,8 @@ export class SqsConsumer implements OnModuleInit, OnModuleDestroy {
         if (this.running) {
           const msg = String(e);
           const queueMissing = msg.includes('Expecting value') || msg.includes('QueueDoesNotExist');
-          // fila ausente = problema de setup, não de runtime: loga 1x e espera mais
           if (queueMissing) {
+            // fila ausente = problema de setup, não de runtime: loga 1x e espera mais
             if (!this.loggedQueueMissing) {
               this.loggedQueueMissing = true;
               this.logger.error({
@@ -107,8 +108,6 @@ export class SqsConsumer implements OnModuleInit, OnModuleDestroy {
       }
     }
   }
-
-  private loggedQueueMissing = false;
 
   private async process(msg: Message): Promise<void> {
     const receiptHandle = msg.ReceiptHandle!;
