@@ -1,0 +1,67 @@
+diagram sequence "Aposta BET — da requisição ao evento"
+
+actor       provider "Provedor de jogos"
+participant api      "API REST"
+service     uc       "SubmitWagerTransactionUseCase"
+database    db       "PostgreSQL"
+queue       sqs      "SQS FIFO"
+service     consumer "SqsConsumer"
+service     worker   "Outbox Publisher"
+queue       events   "wager-events.fifo"
+service     refwkr   "PendingReference Worker"
+
+step "1. Provedor envia a aposta" {
+  provider ->> api : POST /wagering/transactions
+  api -> api : valida DTO + Idempotency-Key
+}
+
+step "2. Idempotência + lock na wallet" {
+  api -> uc : execute(dto, key)
+  uc -> db : SELECT wallet ... FOR UPDATE
+  db --> uc : balance 100.00 (lock adquirido)
+}
+
+step "3. Commit atômico" {
+  uc -> db : wallet 100 -> 75 + ledger DEBIT
+  uc -> db : wager_transactions + inbox + outbox (MESMO commit)
+  db --> uc : OK
+}
+
+step "4. Resposta" {
+  uc --> api : PROCESSED balance 75.00
+  api --> provider : 201 Created
+}
+
+step "5. Replay da mesma chave" {
+  provider ->> api : mesma key, mesmo payload
+  api -> db : SELECT tx (sem lock)
+  db --> api : resulting_balance 75.00
+  api --> provider : 200 idempotentReplay true
+}
+
+step "6. Corrida: duas apostas, um saldo" {
+  provider ->> api : 2 x BET 80.00 paralelo
+  uc -> db : segunda espera o lock da primeira
+  db --> uc : saldo 20.00 insuficiente
+  api --> provider : 422 INSUFFICIENT_BALANCE
+}
+
+step "7. Evento sai do outbox" {
+  worker -> db : claim atômico FOR UPDATE SKIP LOCKED
+  db --> worker : lote de eventos pendentes
+  worker ->> events : WalletBalanceChanged
+  worker -> db : markPublished (commit)
+}
+
+step "8. Referência fora de ordem (REFUND)" {
+  provider ->> sqs : REFUND referencia BET inexistente
+  sqs ->> consumer : entrega
+  consumer -> uc : execute
+  uc -> db : INSERT PENDING_REFERENCE (sem mover saldo)
+  consumer --> sqs : ack (commit)
+  provider ->> sqs : envia a BET referenciada
+  consumer -> uc : processa BET -> saldo cai
+  refwkr -> db : reprocessa PENDING_REFERENCE
+  uc -> db : REFUND aplicado + ledger CREDIT
+  refwkr --> events : WagerTransactionProcessed
+}
