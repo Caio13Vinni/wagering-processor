@@ -24,4 +24,4 @@ lerna-debug.log*
 .tmp
 
 # ide 
-.vscode
+.vscodekeycloakdb.*

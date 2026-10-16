@@ -1,0 +1,27 @@
+{
+  "realm" : "jungle",
+  "users" : [ {
+    "id" : "05ee98a9-d187-475e-9b03-5a6179489e28",
+    "username" : "player1",
+    "firstName" : "Caio",
+    "lastName" : "Ferreira",
+    "email" : "teste@jungle.io",
+    "emailVerified" : false,
+    "createdTimestamp" : 1792177252515,
+    "enabled" : true,
+    "totp" : false,
+    "credentials" : [ {
+      "id" : "212b0134-50c4-4008-90df-b0651bfb8643",
+      "type" : "password",
+      "userLabel" : "My password",
+      "createdDate" : 1792177720422,
+      "secretData" : "{\"value\":\"SxNtpvfZb5PK/MBDeAVevcuNWa0oOtzwRJKt3g6bSCU=\",\"salt\":\"2DewAdBkHEDkOVrg26U4ag==\",\"additionalParameters\":{}}",
+      "credentialData" : "{\"hashIterations\":5,\"algorithm\":\"argon2\",\"additionalParameters\":{\"hashLength\":[\"32\"],\"memory\":[\"7168\"],\"type\":[\"id\"],\"version\":[\"1.3\"],\"parallelism\":[\"1\"]}}"
+    } ],
+    "disableableCredentialTypes" : [ ],
+    "requiredActions" : [ ],
+    "realmRoles" : [ "default-roles-jungle" ],
+    "notBefore" : 0,
+    "groups" : [ ]
+  } ]
+}

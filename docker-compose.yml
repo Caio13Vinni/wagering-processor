@@ -16,12 +16,14 @@ services:
       retries: 30
   keycloak:
     image: quay.io/keycloak/keycloak:25.0
-    command: start-dev
+    command: start-dev --import-realm
     environment:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
     ports:
       - "8080:8080"
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import
 
   sqs:
     image: localstack/localstack:3
