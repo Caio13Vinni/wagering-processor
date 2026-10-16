@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { SendMessageCommand } from '@aws-sdk/client-sqs';
+import { metrics } from '../infrastructure/metrics/metrics';
 import { QUEUES, createSqsClient, queueUrl } from '../infrastructure/sqs/queues';
 
 interface OutboxRow {
@@ -43,6 +44,7 @@ export class OutboxPublisherWorker {
           [row.id],
         );
         this.logger.log({ msg: 'outbox event published', eventId: row.id });
+        metrics.increment('outbox.published');
       } catch (e) {
         const attempts = (row.attempts ?? 0) + 1;
         const delayMs = Math.min(1_000 * 2 ** attempts, 60_000);
@@ -57,8 +59,9 @@ export class OutboxPublisherWorker {
           eventId: row.id,
           attempts,
           nextAttemptInSec: delayMs / 1000,
-          error: String(e),
+          error: String(e),          
         });
+          metrics.increment('outbox.publish_failed');        
       }
     }
   }

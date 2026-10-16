@@ -15,6 +15,7 @@ import { Money } from '../domain/money/money';
 import { LedgerDirection } from '../domain/ledger/ledger-entry';
 import { FailureCode } from '../domain/transaction/failure-codes';
 import { hashWagerPayload, WagerPayload } from '../infrastructure/payload-hash';
+import { metrics } from '../infrastructure/metrics/metrics';
 
 export interface SubmitInput {
   providerId: string;
@@ -92,7 +93,7 @@ export class SubmitWagerTransactionUseCase {
         const validAmount = AMOUNT_PATTERN.test(dto.money.amount);
         if (!validAmount || dto.money.currency !== 'BRL') {
           const code = !validAmount ? FailureCode.InvalidAmount : FailureCode.UnsupportedCurrency;
-          const tx = this.buildRawTransaction(dto, idempotencyKey, payloadHash, 'REJECTED');
+          const tx = this.buildRawTransaction(em, dto, idempotencyKey, payloadHash, 'REJECTED');
           tx.failureCode = code;
           tx.processedAt = new Date();
           em.persist(tx);
@@ -141,7 +142,7 @@ export class SubmitWagerTransactionUseCase {
           });
 
           if (!reference || reference.status !== 'PROCESSED') {
-            const tx = this.buildTransactionEntity(dto, idempotencyKey, payloadHash, money, 'PENDING_REFERENCE');
+            const tx = this.buildTransactionEntity(em, dto, idempotencyKey, payloadHash, money, 'PENDING_REFERENCE');
             tx.attempts = 1;
             tx.nextAttemptAt = new Date(Date.now() + 1_000);
             em.persist(tx);
@@ -155,6 +156,7 @@ export class SubmitWagerTransactionUseCase {
               attempts: 1,
             })));
             await em.flush();
+            metrics.increment('wager.pending_reference_created');
             return { transactionId: tx.id, status: 'PENDING_REFERENCE', idempotentReplay: false };
           }
 
@@ -198,13 +200,13 @@ export class SubmitWagerTransactionUseCase {
         // ---- 7. Persiste transação + saldo + ledger + outbox (mesmo commit) ----
         const txId = randomUUID();
         const now = new Date();
-        const tx = this.buildTransactionEntity(dto, idempotencyKey, payloadHash, money, status, txId);
+        const tx = this.buildTransactionEntity(em, dto, idempotencyKey, payloadHash, money, status, txId);
         tx.referenceTransactionId = reference?.id;
         if (status === 'REJECTED') {
           tx.failureCode = failureCode;
         }
         tx.processedAt = now;
-        // Bug 2 (regra 7): snapshot do saldo — replay responde o resultado ORIGINAL
+        // Regra 7: snapshot do saldo — replay responde o resultado ORIGINAL
         if (status === 'PROCESSED' && direction !== undefined) {
           tx.resultingBalance = balanceAfter.toJSON().amount;
         }
@@ -284,7 +286,7 @@ export class SubmitWagerTransactionUseCase {
         };
       });
     } catch (e) {
-      // ---- Bug 1: corrida de idempotência — a unique constraint decide quem venceu ----
+      // ---- Corrida de idempotência — a unique constraint decide quem venceu ----
       // A transação perdedora abortou; a re-leitura ACONTECE EM FORK NOVO
       // (a transação abortada não pode mais executar SQL).
       if (isUniqueViolation(e)) {
@@ -294,6 +296,7 @@ export class SubmitWagerTransactionUseCase {
           msg: 'duplicate request resolved by unique constraint',
           outcome: 'replay-or-conflict',
         });
+        metrics.increment('wager.duplicates_detected', { channel: source.channel });
         // Três desfechos semanticamente distintos:
         //   1. winner + hash igual  → replay legítimo
         //   2. winner + hash difere → 409 (conflito real de payload)
@@ -312,7 +315,7 @@ export class SubmitWagerTransactionUseCase {
   }
 
   /**
-   * Lote E: reprocessa uma transação PENDING_REFERENCE (worker agendado).
+   * Reprocessa uma transação PENDING_REFERENCE (worker agendado).
    * Referência agora existe e está PROCESSED → aplica a movimentação (mesma
    * lógica do fluxo principal, mesmo commit: saldo + ledger + outbox + status).
    * Ainda ausente → backoff exponencial; esgotado → REJECTED + evento (mesmo commit).
@@ -530,6 +533,7 @@ export class SubmitWagerTransactionUseCase {
    * no processamento — lido do snapshot, sem tocar na wallet, sem lock.
    */
   private replayResult(existing: WagerTransactionEntity | null): SubmitResult {
+    metrics.increment('wager.idempotent_replay');
     return {
       transactionId: existing?.id ?? 'unknown',
       status: (existing?.status as SubmitResult['status']) ?? 'PENDING_REFERENCE',
@@ -550,7 +554,7 @@ export class SubmitWagerTransactionUseCase {
     correlationId: string,
     referenceTransactionId?: string,
   ): Promise<SubmitResult> {
-    const tx = this.buildRawTransaction(dto, idempotencyKey, payloadHash, 'REJECTED');
+    const tx = this.buildRawTransaction(em, dto, idempotencyKey, payloadHash, 'REJECTED');
     tx.failureCode = code;
     tx.referenceTransactionId = referenceTransactionId;
     tx.processedAt = new Date();
@@ -630,7 +634,13 @@ export class SubmitWagerTransactionUseCase {
     return undefined;
   }
 
+  /**
+   * IMPORTANTE: `em.create` SEMPRE com o EM do contexto transacional (parâmetro),
+   * nunca com `this.em` — entidades criadas no fork singleton permaneceriam NEW
+   * no Unit of Work e seriam re-inseridas (23505) a cada flush posterior.
+   */
   private buildTransactionEntity(
+    em: EntityManager,
     dto: SubmitInput,
     idempotencyKey: string,
     payloadHash: string,
@@ -638,7 +648,7 @@ export class SubmitWagerTransactionUseCase {
     status: string,
     id: string = randomUUID(),
   ): WagerTransactionEntity {
-    return this.em.create(WagerTransactionEntity, {
+    return em.create(WagerTransactionEntity, {
       id,
       providerId: dto.providerId,
       externalTransactionId: dto.externalTransactionId,
@@ -662,13 +672,14 @@ export class SubmitWagerTransactionUseCase {
    * senão 'abc'/'1e10' quebram o INSERT na coluna numeric(19,2).
    */
   private buildRawTransaction(
+    em: EntityManager,
     dto: SubmitInput,
     idempotencyKey: string,
     payloadHash: string,
     status: string,
   ): WagerTransactionEntity {
     const safeAmount = AMOUNT_PATTERN.test(dto.money.amount) ? dto.money.amount : '0.00';
-    return this.em.create(WagerTransactionEntity, {
+    return em.create(WagerTransactionEntity, {
       id: randomUUID(),
       providerId: dto.providerId,
       externalTransactionId: dto.externalTransactionId,

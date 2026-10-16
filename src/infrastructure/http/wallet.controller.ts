@@ -7,6 +7,7 @@ import { CreateWalletUseCase } from '../../application/create-wallet.use-case';
 import { WalletEntity } from '../../domain/wallet/wallet.entity';
 import { WalletLedgerEntryEntity } from '../../domain/ledger/ledger-entry.entity';
 import { CreateWalletDto } from './dto';
+import { metrics } from '../metrics/metrics';
 
 @Controller('wallets')
 export class WalletController {
@@ -119,7 +120,7 @@ export class WalletController {
     const consistent = stored.equals(calculated);
 
     if (!consistent) {
-      // G: aqui entra a métrica (wallets.reconciliation_mismatch) no Lote G
+      metrics.increment('wallets.reconciliation_mismatch');
       console.warn(JSON.stringify({
         msg: 'reconciliation mismatch',
         walletId,

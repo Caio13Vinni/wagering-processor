@@ -12,10 +12,11 @@ import { DomainExceptionFilter } from './infrastructure/http/domain-exception.fi
 import { SqsConsumer } from './infrastructure/sqs/sqs-consumer';
 import { OutboxPublisherWorker } from './workers/outbox-publisher.worker';
 import { PendingReferenceWorker } from './workers/pending-reference.worker';
+import { MetricsController } from './infrastructure/http/metrics.controller';
 
 @Module({
   imports: [ScheduleModule.forRoot()],
-  controllers: [WalletController, WageringController, HealthController],
+  controllers: [WalletController, WageringController, HealthController, MetricsController],
   providers: [
     { provide: EntityManager, useValue: orm.em.fork() },
     CreateWalletUseCase,
