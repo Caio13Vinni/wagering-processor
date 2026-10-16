@@ -13,5 +13,12 @@ export const env = {
       process.env.SQS_TRANSACTIONS_QUEUE_URL ??
       'http://localhost:4566/000000000000/wager-transactions.fifo',
   },
+  auth: {
+    enabled: (process.env.AUTH_ENABLED ?? 'false') === 'true',
+    issuerUrl:
+      process.env.KEYCLOAK_ISSUER_URL ??
+      'http://localhost:8080/realms/jungle',
+    audience: process.env.KEYCLOAK_AUDIENCE ?? 'wagering-api',
+  },
   port: Number(process.env.PORT ?? 3000),
 };
