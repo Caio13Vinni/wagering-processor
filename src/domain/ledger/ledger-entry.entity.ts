@@ -14,8 +14,8 @@ export class WalletLedgerEntryEntity {
   @Property({ type: 'uuid' })
   transactionId!: string;
 
-  // 'DEBIT' | 'CREDIT'
-  @Property({ type: 'char', length: 6 })
+  // 'DEBIT' | 'CREDIT' — varchar(6): varchar(6) paddeia 'DEBIT ' e quebra filtros SQL
+  @Property({ type: 'varchar', length: 6 })
   direction!: string;
 
   @Property({ type: 'decimal', precision: 19, scale: 2 })

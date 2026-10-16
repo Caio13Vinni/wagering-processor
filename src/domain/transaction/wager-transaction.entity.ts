@@ -56,6 +56,9 @@ export class WagerTransactionEntity {
   @Property({ length: 48, nullable: true })
   failureCode?: string;
 
+  @Property({ type: 'decimal', precision: 19, scale: 2, nullable: true })
+  resultingBalance?: string;
+
   @Property({ type: 'integer', nullable: true })
   attempts?: number = 0;
 

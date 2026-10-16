@@ -42,6 +42,8 @@ export interface SubmitResult {
   idempotentReplay: boolean;
 }
 
+const AMOUNT_PATTERN = /^\d+(\.\d{1,2})?$/;
+
 @Injectable()
 export class SubmitWagerTransactionUseCase {
   private readonly logger = new Logger(SubmitWagerTransactionUseCase.name);
@@ -84,7 +86,7 @@ export class SubmitWagerTransactionUseCase {
         }
 
         // ---- 3. Validação de formato do dinheiro ----
-        const validAmount = /^\d+(\.\d{1,2})?$/.test(dto.money.amount);
+        const validAmount = AMOUNT_PATTERN.test(dto.money.amount);
         if (!validAmount || dto.money.currency !== 'BRL') {
           const code = !validAmount ? FailureCode.InvalidAmount : FailureCode.UnsupportedCurrency;
           const tx = this.buildRawTransaction(dto, idempotencyKey, payloadHash, 'REJECTED');
@@ -116,6 +118,16 @@ export class SubmitWagerTransactionUseCase {
           return this.reject(em, dto, idempotencyKey, payloadHash, FailureCode.CurrencyMismatch, correlationId);
         }
         const balanceBefore = Money.rehydrate({ amount: wallet.balance, currency: wallet.currency });
+
+        // ---- 4b. BUG 3: REFUND/ROLLBACK exigem referência; auto-referência é rejeitada ----
+        if (dto.kind === 'REFUND' || dto.kind === 'ROLLBACK') {
+          if (!dto.referenceExternalTransactionId) {
+            return this.reject(em, dto, idempotencyKey, payloadHash, FailureCode.MissingReference, correlationId);
+          }
+          if (dto.referenceExternalTransactionId === dto.externalTransactionId) {
+            return this.reject(em, dto, idempotencyKey, payloadHash, FailureCode.SelfReference, correlationId);
+          }
+        }
 
         // ---- 5. Resolve referência (REFUND/ROLLBACK) ----
         let reference: WagerTransactionEntity | null = null;
@@ -189,6 +201,10 @@ export class SubmitWagerTransactionUseCase {
           tx.failureCode = failureCode;
         }
         tx.processedAt = now;
+        // BUG 2 (regra 7): snapshot do saldo — replay responde o resultado ORIGINAL
+        if (status === 'PROCESSED' && direction !== undefined) {
+          tx.resultingBalance = balanceAfter.toJSON().amount;
+        }
         em.persist(tx);
 
         if (status === 'PROCESSED' && direction !== undefined) {
@@ -265,23 +281,13 @@ export class SubmitWagerTransactionUseCase {
         };
       });
     } catch (e) {
-      // ---- CORREÇÃO BUG 1: corrida de idempotência ----
-      // Duas requisições com a mesma key passam pelo passo 2 ao mesmo tempo.
-      // A unique constraint do schema decide quem venceu; a transação perdedora
-      // abortou, então a re-leitura ACONTECE EM FORK NOVO (a transação abortada
-      // não pode mais executar SQL: "current transaction is aborted").
+      // ---- Corrida de idempotência: a constraint decide quem venceu ----
       if (isUniqueViolation(e)) {
         this.logger.warn({
           correlationId,
           idempotencyKey,
           msg: 'idempotency race resolved by unique constraint',
         });
-        // Re-leitura com retry: sob 50+ concorrentes, o fork pode competir por
-        // conexão do pool — o winner commitado nem sempre é visível no 1º instante.
-        // Três desfechos possíveis, semanticamente distintos:
-        //   1. winner + hash igual  → replay legítimo
-        //   2. winner + hash difere → 409 (conflito real de payload)
-        //   3. winner não visível   → 503 transitório (NUNCA mentir 409)
         const winner = await this.findWinner(idempotencyKey);
         if (winner && winner.payloadHash === payloadHash) {
           return this.replayResult(winner);
@@ -305,16 +311,23 @@ export class SubmitWagerTransactionUseCase {
     for (let i = 0; i < attempts; i++) {
       const found = await this.em.fork().findOne(WagerTransactionEntity, { idempotencyKey });
       if (found) return found;
-      await new Promise((r) => setTimeout(r, 25 * (i + 1))); // 25, 50, 75, 100, 125ms
+      await new Promise((r) => setTimeout(r, 25 * (i + 1)));
     }
     return null;
   }
 
+  /**
+   * Replay devolve o resultado ORIGINAL (regra 7), incluindo o saldo observado
+   * no processamento — lido do snapshot, sem tocar na wallet, sem lock.
+   */
   private replayResult(existing: WagerTransactionEntity | null): SubmitResult {
     return {
       transactionId: existing?.id ?? 'unknown',
       status: (existing?.status as SubmitResult['status']) ?? 'PENDING_REFERENCE',
       failureCode: existing?.failureCode ?? undefined,
+      balance: existing?.resultingBalance
+        ? { amount: existing.resultingBalance, currency: existing.currency }
+        : undefined,
       idempotentReplay: true,
     };
   }
@@ -411,12 +424,17 @@ export class SubmitWagerTransactionUseCase {
     });
   }
 
+  /**
+   * Transação REJECTADA sem Money validado — BUG 4: sanitiza o amount antes de
+   * gravar, senão 'abc'/'1e10' quebram o INSERT na coluna numeric(19,2) (500 em vez de 422).
+   */
   private buildRawTransaction(
     dto: SubmitInput,
     idempotencyKey: string,
     payloadHash: string,
     status: string,
   ): WagerTransactionEntity {
+    const safeAmount = AMOUNT_PATTERN.test(dto.money.amount) ? dto.money.amount : '0.00';
     return this.em.create(WagerTransactionEntity, {
       id: randomUUID(),
       providerId: dto.providerId,
@@ -428,7 +446,7 @@ export class SubmitWagerTransactionUseCase {
       roundId: dto.roundId,
       gameId: dto.gameId,
       kind: dto.kind,
-      amount: dto.money.amount,
+      amount: safeAmount,
       currency: dto.money.currency,
       referenceExternalTransactionId: dto.referenceExternalTransactionId,
       status,
