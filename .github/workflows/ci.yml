@@ -1,11 +1,70 @@
 name: ci
+
 on: [push, pull_request]
+
 jobs:
-  test:
+  # ── 1. qualidade: compilação limpa em modo estrito ──────────────────
+  quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
-        with: { bun-version: 1.x }
+        with:
+          bun-version: 1.x
       - run: bun install --frozen-lockfile
-      - run: bun test
+      - name: typecheck (strict)
+        run: bun x tsc --noEmit
+
+  # ── 2. testes: bun test contra PostgreSQL REAL (nada de mock) ───────
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: wager
+          POSTGRES_PASSWORD: wager
+          POSTGRES_DB: wager
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wager"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      DB_HOST: localhost
+      DB_PORT: '5432'
+      DB_USER: wager
+      DB_PASSWORD: wager
+      DB_NAME: wager
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.x
+      - run: bun install --frozen-lockfile
+      - name: migrations
+        run: bun run migration:up
+      - name: test (unit + integração + concorrência real)
+        run: bun test
+
+  # ── 3. docker: compose válido + imagem da app builda ────────────────
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compose config valid
+        run: docker compose config --quiet
+      - name: build app image
+        run: docker compose build app
+
+  # ── 4. smoke: stack completo no ar, health ready responde ───────────
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --wait postgres sqs
+      - run: docker compose run --rm app sh -c "bun run migration:up && bun run setup:queues"
+      - run: docker compose up -d --wait app
+      - run: curl -sf localhost:3000/health/ready
