@@ -1,75 +1,73 @@
 import {
-  CreateQueueCommand,
-  GetQueueUrlCommand,
-  QueueNameExists,
-  QueueDoesNotExist,
-  SQSClient,
-  SendMessageCommand,
+  CreateQueueCommand, GetQueueAttributesCommand, SetQueueAttributesCommand, SQSClient,
 } from '@aws-sdk/client-sqs';
 import { env } from '../../config/env';
 
-export const TRANSACTIONS_QUEUE = 'wager-transactions.fifo';
-export const TRANSACTIONS_DLQ = 'wager-transactions-dlq.fifo';
-export const EVENTS_QUEUE = 'wager-events.fifo';
+export const QUEUES = {
+  WAGER_TRANSACTIONS: 'wager-transactions.fifo',
+  WAGER_TRANSACTIONS_DLQ: 'wager-transactions-dlq.fifo',
+  WAGER_EVENTS: 'wager-events.fifo',
+} as const;
 
-export const sqsClient = new SQSClient({
-  region: env.sqs.region,
-  endpoint: env.sqs.endpoint,
-  // credenciais dummy para LocalStack — em produção virão do IAM role
-  credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
-});
-
-const urlCache = new Map<string, string>();
-
-export async function queueUrl(name: string): Promise<string> {
-  const cached = urlCache.get(name);
-  if (cached) return cached;
-  try {
-    const res = await sqsClient.send(new GetQueueUrlCommand({ QueueName: name }));
-    urlCache.set(name, res.QueueUrl!);
-    return res.QueueUrl!;
-  } catch (err) {
-    if (err instanceof QueueDoesNotExistError) {
-      throw new Error(`queue "${name}" não existe — rode scripts/init-queues.sh`);
-    }
-    throw err;
-  }
+export function createSqsClient(): SQSClient {
+  return new SQSClient({
+    endpoint: env.sqs.endpoint,
+    region: env.sqs.region,
+    credentials: { accessKeyId: 'test', secretAccessKey: 'test' }, // LocalStack
+  });
 }
 
-/** Idempotente: cria DLQ, fila principal com redrive policy e fila de eventos. */
+/** LocalStack aceita URL no formato {endpoint}/{account}/{queueName}. */
+export function queueUrl(name: string): string {
+  return `${env.sqs.endpoint}/000000000000/${name}`;
+}
+
+const FIFO_ATTRS = { FifoQueue: 'true', ContentBasedDeduplication: 'false' };
+
+/** Idempotente: cria as filas ou atualiza atributos se já existirem. */
 export async function ensureQueues(): Promise<void> {
-  await createFifoQueue(TRANSACTIONS_DLQ);
-  await createFifoQueue(TRANSACTIONS_QUEUE, {
+  const client = createSqsClient();
+
+  await upsertQueue(client, QUEUES.WAGER_TRANSACTIONS_DLQ, FIFO_ATTRS);
+  const dlqArn = (
+    await client.send(new GetQueueAttributesCommand({
+      QueueUrl: queueUrl(QUEUES.WAGER_TRANSACTIONS_DLQ),
+      AttributeNames: ['QueueArn'],
+    }))
+  ).Attributes?.QueueArn;
+
+  await upsertQueue(client, QUEUES.WAGER_TRANSACTIONS, {
+    ...FIFO_ATTRS,
+    VisibilityTimeout: '30',
     RedrivePolicy: JSON.stringify({
-      deadLetterTargetArn: `arn:aws:sqs:${env.sqs.region}:000000000000:${TRANSACTIONS_DLQ}`,
+      deadLetterTargetArn: dlqArn,
       maxReceiveCount: '5',
     }),
   });
-  await createFifoQueue(EVENTS_QUEUE);
+
+  await upsertQueue(client, QUEUES.WAGER_EVENTS, FIFO_ATTRS);
 }
 
-async function createFifoQueue(name: string, attributes?: Record<string, string>): Promise<void> {
-  try {
-    await sqsClient.send(new CreateQueueCommand({
-      QueueName: name,
-      Attributes: { FifoQueue: 'true', ...attributes },
-    }));
-  } catch (err) {
-    if (!(err instanceof QueueNameExistsError)) throw err;
-  }
-}
-
-/** Envio FIFO com deduplicação no broker (otimização — a garantia final continua no banco). */
-export async function sendFifoMessage(
-  url: string,
-  body: string,
-  messageGroupId: string,
-  messageDeduplicationId: string,
+async function upsertQueue(
+  client: SQSClient,
+  name: string,
+  attributes: Record<string, string>,
 ): Promise<void> {
-  await sqsClient.send(new SendMessageCommand({
-    QueueUrl: url,
-    MessageBody: body,
-    MessageGroupId: messageGroupId,
-    MessageDeduplicationId: messageDeduplicationId,
-  }));
+  try {
+    await client.send(new CreateQueueCommand({ QueueName: name, Attributes: attributes }));
+  } catch (e) {
+    // fila já existe com atributos diferentes → atualiza em vez de falhar.
+    // detecção por string é proposital: o formato varia entre runtimes
+    // (Bun vs Node expõem propriedades do erro do SDK de formas diferentes)
+    const s = String(e);
+    if (s.includes('QueueNameExists') || s.includes('queue already exists') ||
+        (e as { name?: string }).name === 'QueueNameExists') {
+      await client.send(new SetQueueAttributesCommand({
+        QueueUrl: queueUrl(name),
+        Attributes: attributes,
+      }));
+    } else {
+      throw e;
+    }
+  }
 }
