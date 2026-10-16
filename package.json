@@ -4,6 +4,7 @@
   "description": "Distributed wagering transaction processor with ledger-based accounting, idempotency and at-least-once messaging guarantees",
   "type": "module",
   "scripts": {
+    "setup:queues": "bun scripts/setup-queues.ts",
     "start": "bun run src/main.ts",
     "migration:create": "bun run scripts/migration-create.ts",
     "migration:up": "bun run scripts/migration-up.ts",

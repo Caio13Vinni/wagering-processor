@@ -9,15 +9,18 @@ import { WalletController } from './infrastructure/http/wallet.controller';
 import { WageringController } from './infrastructure/http/wagering.controller';
 import { HealthController } from './infrastructure/http/health.controller';
 import { DomainExceptionFilter } from './infrastructure/http/domain-exception.filter';
+import { SqsConsumer } from './infrastructure/sqs/sqs-consumer';
+import { OutboxPublisherWorker } from './workers/outbox-publisher.worker';
 
 @Module({
   imports: [ScheduleModule.forRoot()],
   controllers: [WalletController, WageringController, HealthController],
   providers: [
-    // DI do EntityManager no lugar do MikroOrmModule (incompatível com Bun)
     { provide: EntityManager, useValue: orm.em.fork() },
     CreateWalletUseCase,
     SubmitWagerTransactionUseCase,
+    SqsConsumer,
+    OutboxPublisherWorker,
     { provide: APP_FILTER, useClass: DomainExceptionFilter },
   ],
 })
