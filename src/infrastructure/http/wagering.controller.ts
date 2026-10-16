@@ -5,7 +5,6 @@ import type { Response } from 'express';
 import { EntityManager } from '@mikro-orm/postgresql';
 import {
   SubmitWagerTransactionUseCase,
-  IdempotencyRaceUnresolvedError,
 } from '../../application/submit-wager-transaction.use-case';
 import { WagerTransactionEntity } from '../../domain/transaction/wager-transaction.entity';
 import { SubmitWagerTransactionDto } from './dto';
@@ -24,13 +23,14 @@ export class WageringController {
     @Res({ passthrough: true }) res: Response,
   ) {
     if (!idempotencyKey || idempotencyKey.trim() === '') {
-      // o header é obrigatório e é a FONTE DA VERDADE da idempotência
+      // o header e obrigatorio e e a FONTE DA VERDADE da idempotencia
       res.status(HttpStatus.BAD_REQUEST);
-      return {
-        statusCode: 400,
-        error: 'MissingIdempotencyKey',
-        message: 'Idempotency-Key header is required',
-      };
+      return { statusCode: 400, error: 'MissingIdempotencyKey', message: 'Idempotency-Key header is required' };
+    }
+    if (idempotencyKey.length > 255) {
+      // key maior que a coluna varchar(255) viraria 500 no insert — 400 explicito
+      res.status(HttpStatus.BAD_REQUEST);
+      return { statusCode: 400, error: 'IdempotencyKeyTooLong', message: 'Idempotency-Key must be at most 255 characters' };
     }
 
     const result = await this.submit.execute(dto, idempotencyKey, { channel: 'http' });
@@ -48,7 +48,7 @@ export class WageringController {
     if (result.idempotentReplay) res.status(HttpStatus.OK);
     else if (result.status === 'PROCESSED') res.status(HttpStatus.CREATED);
     else if (result.status === 'PENDING_REFERENCE') res.status(HttpStatus.ACCEPTED);
-    else res.status(HttpStatus.UNPROCESSABLE_ENTITY); // REJECTED = regra de negócio
+    else res.status(HttpStatus.UNPROCESSABLE_ENTITY); // REJECTED = regra de negocio
 
     return body;
   }

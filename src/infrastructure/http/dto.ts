@@ -2,8 +2,9 @@ import { IsIn, IsNotEmpty, IsOptional, IsString, IsUUID, Matches, MaxLength, Val
 import { Type } from 'class-transformer';
 
 export class MoneyDto {
-  /** String decimal, escala 2 — regex rejeita notação científica, NaN, Infinity */
-  @Matches(/^\d+(\.\d{1,2})?$/, { message: 'amount must be a decimal string with up to 2 places' })
+  /** String decimal, ate 17 digitos inteiros + 2 casas — rejeita notacao cientifica,
+   * NaN, Infinity e estouro do numeric(19,2)  */
+  @Matches(/^\d{1,17}(\.\d{1,2})?$/, { message: 'amount must be a decimal string with up to 2 places and 17 integer digits' })
   amount!: string;
 
   @IsIn(['BRL'], { message: 'currency must be BRL' })
@@ -11,7 +12,7 @@ export class MoneyDto {
 }
 
 export class CreateWalletDto {
-  @IsUUID() // sem versão: o desafio usa UUIDv7 (0192f28f-...)
+  @IsUUID() 
   playerId!: string;
 
   @ValidateNested()

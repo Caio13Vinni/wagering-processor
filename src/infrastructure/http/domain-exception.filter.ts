@@ -10,13 +10,13 @@ import { MoneyError } from '../../domain/money/money';
 
 /**
  * Mapeamento consistente entre TODOS os endpoints:
- *   400 payload inválido (ValidationPipe/MoneyError)
- *   404 não encontrado
- *   409 conflito (idempotência, wallet duplicada)
- *   422 rejeição de NEGÓCIO (vinda como resultado, não exceção)
+ *   400 payload invalido (ValidationPipe/MoneyError)
+ *   404 nao encontrado
+ *   409 conflito (idempotencia, wallet duplicada)
+ *   422 rejeicao de NEGOCIO (vinda como resultado, nao excecao)
  *   202 aceite com processamento pendente
- *   503 falha transitória de infraestrutura
- *   500 falha não tratada
+ *   503 falha transitoria de infraestrutura
+ *   500 falha nao tratada — SEM vazar exception.message (pode conter SQL/dados)
  */
 @Catch()
 export class DomainExceptionFilter implements ExceptionFilter {
@@ -27,7 +27,6 @@ export class DomainExceptionFilter implements ExceptionFilter {
     const res = ctx.getResponse();
     const req = ctx.getRequest();
 
-    // 1. exceções HTTP do Nest (ValidationPipe, NotFoundException, etc.) passam com o status delas
     if (exception instanceof HttpException) {
       const status = exception.getStatus();
       const response = exception.getResponse();
@@ -39,24 +38,22 @@ export class DomainExceptionFilter implements ExceptionFilter {
       return;
     }
 
-    // 2. exceções de domínio
     let statusCode: number;
     let error: string;
 
     if (exception instanceof IdempotencyConflictError) {
-      statusCode = HttpStatus.CONFLICT; // 409
+      statusCode = HttpStatus.CONFLICT;
       error = 'IdempotencyConflict';
     } else if (exception instanceof WalletAlreadyExistsError) {
-      statusCode = HttpStatus.CONFLICT; // 409
+      statusCode = HttpStatus.CONFLICT;
       error = 'WalletAlreadyExists';
     } else if (exception instanceof IdempotencyRaceUnresolvedError) {
-      statusCode = HttpStatus.SERVICE_UNAVAILABLE; // 503 transitório
+      statusCode = HttpStatus.SERVICE_UNAVAILABLE;
       error = 'TransientInfrastructure';
     } else if (exception instanceof MoneyError) {
-      statusCode = HttpStatus.BAD_REQUEST; // 400
+      statusCode = HttpStatus.BAD_REQUEST;
       error = exception.code;
     } else {
-      // 3. desconhecido = falha não tratada
       this.logger.error({
         msg: 'unhandled exception',
         path: req.url,
@@ -69,7 +66,9 @@ export class DomainExceptionFilter implements ExceptionFilter {
     res.status(statusCode).json({
       statusCode,
       error,
-      message: exception instanceof Error ? exception.message : 'unknown error',
+      message: statusCode === HttpStatus.INTERNAL_SERVER_ERROR
+        ? 'unexpected error'
+        : exception instanceof Error ? exception.message : 'unknown error',
       path: req.url,
     });
   }

@@ -43,7 +43,7 @@ export interface SubmitResult {
   idempotentReplay: boolean;
 }
 
-const AMOUNT_PATTERN = /^\d+(\.\d{1,2})?$/;
+const AMOUNT_PATTERN = /^\d{1,17}(\.\d{1,2})?$/;
 
 /** Tentativas de resolução de referência antes de REJECTED (TTL ~45min com backoff de 5s). */
 const MAX_REFERENCE_ATTEMPTS = 10;
@@ -141,6 +141,11 @@ export class SubmitWagerTransactionUseCase {
             externalTransactionId: dto.referenceExternalTransactionId,
           });
 
+          // referencia TERMINAL (REJECTED/FAILED): nunca virara PROCESSED --
+          // rejeita imediatamente em vez de pendurar 45min como PENDING_REFERENCE
+          if (reference && (reference.status === 'REJECTED' || reference.status === 'FAILED')) {
+            return this.reject(em, dto, idempotencyKey, payloadHash, FailureCode.ReferenceNotProcessed, correlationId);
+          }
           if (!reference || reference.status !== 'PROCESSED') {
             const tx = this.buildTransactionEntity(em, dto, idempotencyKey, payloadHash, money, 'PENDING_REFERENCE');
             tx.attempts = 1;
@@ -157,6 +162,7 @@ export class SubmitWagerTransactionUseCase {
             })));
             await em.flush();
             metrics.increment('wager.pending_reference_created');
+            metrics.increment('wager.transactions', { status: 'PENDING_REFERENCE', kind: dto.kind });
             return { transactionId: tx.id, status: 'PENDING_REFERENCE', idempotentReplay: false };
           }
 
@@ -277,6 +283,7 @@ export class SubmitWagerTransactionUseCase {
 
         await em.flush();
 
+        metrics.increment('wager.transactions', { status, kind: dto.kind });
         return {
           transactionId: txId,
           status,
@@ -364,6 +371,10 @@ export class SubmitWagerTransactionUseCase {
       const attempts = (tx.attempts ?? 0) + 1;
 
       // ---- referência ainda não disponível: backoff ou esgotamento ----
+      // referencia terminal: rejeita ja (mesma regra do fluxo principal)
+      if (reference && (reference.status === 'REJECTED' || reference.status === 'FAILED')) {
+        return this.rejectExisting(em, tx, FailureCode.ReferenceNotProcessed, correlationId);
+      }
       if (!reference || reference.status !== 'PROCESSED') {
         if (attempts >= MAX_REFERENCE_ATTEMPTS) {
           tx.status = 'REJECTED';
