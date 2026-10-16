@@ -44,6 +44,9 @@ export interface SubmitResult {
 
 const AMOUNT_PATTERN = /^\d+(\.\d{1,2})?$/;
 
+/** Tentativas de resolução de referência antes de REJECTED (TTL ~45min com backoff de 5s). */
+const MAX_REFERENCE_ATTEMPTS = 10;
+
 @Injectable()
 export class SubmitWagerTransactionUseCase {
   private readonly logger = new Logger(SubmitWagerTransactionUseCase.name);
@@ -119,7 +122,7 @@ export class SubmitWagerTransactionUseCase {
         }
         const balanceBefore = Money.rehydrate({ amount: wallet.balance, currency: wallet.currency });
 
-        // ---- 4b. BUG 3: REFUND/ROLLBACK exigem referência; auto-referência é rejeitada ----
+        // ---- 4b. REFUND/ROLLBACK exigem referência; auto-referência é rejeitada ----
         if (dto.kind === 'REFUND' || dto.kind === 'ROLLBACK') {
           if (!dto.referenceExternalTransactionId) {
             return this.reject(em, dto, idempotencyKey, payloadHash, FailureCode.MissingReference, correlationId);
@@ -184,7 +187,7 @@ export class SubmitWagerTransactionUseCase {
             status = 'REJECTED';
             failureCode = dto.kind === 'BET'
               ? FailureCode.InsufficientBalance
-              : FailureCode.InsufficientBalanceForReversal;
+              : FailureCode.InsufficientBalanceForReversal; // regra 9: código distinto
           } else {
             balanceAfter = balanceBefore.subtract(money);
           }
@@ -201,7 +204,7 @@ export class SubmitWagerTransactionUseCase {
           tx.failureCode = failureCode;
         }
         tx.processedAt = now;
-        // BUG 2 (regra 7): snapshot do saldo — replay responde o resultado ORIGINAL
+        // Bug 2 (regra 7): snapshot do saldo — replay responde o resultado ORIGINAL
         if (status === 'PROCESSED' && direction !== undefined) {
           tx.resultingBalance = balanceAfter.toJSON().amount;
         }
@@ -281,13 +284,20 @@ export class SubmitWagerTransactionUseCase {
         };
       });
     } catch (e) {
-      // ---- Corrida de idempotência: a constraint decide quem venceu ----
+      // ---- Bug 1: corrida de idempotência — a unique constraint decide quem venceu ----
+      // A transação perdedora abortou; a re-leitura ACONTECE EM FORK NOVO
+      // (a transação abortada não pode mais executar SQL).
       if (isUniqueViolation(e)) {
-        this.logger.warn({
+        this.logger.log({
           correlationId,
           idempotencyKey,
-          msg: 'idempotency race resolved by unique constraint',
+          msg: 'duplicate request resolved by unique constraint',
+          outcome: 'replay-or-conflict',
         });
+        // Três desfechos semanticamente distintos:
+        //   1. winner + hash igual  → replay legítimo
+        //   2. winner + hash difere → 409 (conflito real de payload)
+        //   3. winner não visível   → erro transitório (NUNCA mentir 409)
         const winner = await this.findWinner(idempotencyKey);
         if (winner && winner.payloadHash === payloadHash) {
           return this.replayResult(winner);
@@ -299,6 +309,205 @@ export class SubmitWagerTransactionUseCase {
       }
       throw e;
     }
+  }
+
+  /**
+   * Lote E: reprocessa uma transação PENDING_REFERENCE (worker agendado).
+   * Referência agora existe e está PROCESSED → aplica a movimentação (mesma
+   * lógica do fluxo principal, mesmo commit: saldo + ledger + outbox + status).
+   * Ainda ausente → backoff exponencial; esgotado → REJECTED + evento (mesmo commit).
+   */
+  async reprocess(txId: string): Promise<SubmitResult> {
+    const correlationId = randomUUID();
+    return this.em.transactional(async (em) => {
+      const tx = await em.findOne(WagerTransactionEntity, { id: txId }, {
+        lockMode: LockMode.PESSIMISTIC_WRITE, // serializa entre instâncias do worker
+      });
+      if (!tx) throw new Error(`transaction ${txId} not found`);
+
+      if (tx.status !== 'PENDING_REFERENCE') {
+        // resolvida por outra instância/caminho enquanto esperávamos — devolve o estado atual
+        return {
+          transactionId: tx.id,
+          status: tx.status as SubmitResult['status'],
+          failureCode: tx.failureCode ?? undefined,
+          balance: tx.resultingBalance
+            ? { amount: tx.resultingBalance, currency: tx.currency }
+            : undefined,
+          idempotentReplay: true,
+        };
+      }
+
+      const dto: SubmitInput = {
+        providerId: tx.providerId,
+        externalTransactionId: tx.externalTransactionId,
+        playerId: tx.playerId,
+        walletId: tx.walletId,
+        roundId: tx.roundId,
+        gameId: tx.gameId,
+        kind: tx.kind as SubmitInput['kind'],
+        money: { amount: tx.amount, currency: tx.currency },
+        referenceExternalTransactionId: tx.referenceExternalTransactionId,
+      };
+      const money = Money.rehydrate({ amount: tx.amount, currency: tx.currency });
+
+      const reference = tx.referenceExternalTransactionId
+        ? await em.findOne(WagerTransactionEntity, {
+            providerId: tx.providerId,
+            externalTransactionId: tx.referenceExternalTransactionId,
+          })
+        : null;
+
+      const attempts = (tx.attempts ?? 0) + 1;
+
+      // ---- referência ainda não disponível: backoff ou esgotamento ----
+      if (!reference || reference.status !== 'PROCESSED') {
+        if (attempts >= MAX_REFERENCE_ATTEMPTS) {
+          tx.status = 'REJECTED';
+          tx.failureCode = FailureCode.MissingReference;
+          tx.processedAt = new Date();
+          em.persist(OutboxMessageEntity.enqueue(WagerTransactionRejected.from({
+            correlationId,
+            transactionId: tx.id,
+            providerId: tx.providerId,
+            externalTransactionId: tx.externalTransactionId,
+            walletId: tx.walletId,
+            kind: tx.kind,
+            failureCode: FailureCode.MissingReference,
+          })));
+          await em.flush();
+          return {
+            transactionId: tx.id, status: 'REJECTED',
+            failureCode: FailureCode.MissingReference, idempotentReplay: false,
+          };
+        }
+        tx.attempts = attempts;
+        // backoff exponencial: 5s, 10s, 20s ... teto 15min
+        tx.nextAttemptAt = new Date(Date.now() + Math.min(5_000 * 2 ** (attempts - 1), 900_000));
+        await em.flush();
+        return { transactionId: tx.id, status: 'PENDING_REFERENCE', idempotentReplay: false };
+      }
+
+      // ---- referência pronta: mesmas validações de domínio do fluxo principal ----
+      const scopeError = this.validateReference(dto, reference, money);
+      if (scopeError) {
+        return this.rejectExisting(em, tx, scopeError, correlationId);
+      }
+      const alreadyReverted = await em.findOne(WagerTransactionEntity, {
+        providerId: tx.providerId,
+        referenceExternalTransactionId: tx.referenceExternalTransactionId!,
+        kind: tx.kind,
+        status: 'PROCESSED',
+      });
+      if (alreadyReverted) {
+        return this.rejectExisting(em, tx, FailureCode.ReferenceAlreadyReverted, correlationId);
+      }
+
+      // ---- aplica a movimentação (espelha passos 6-7 do execute) ----
+      const wallet = await em.findOne(WalletEntity, { id: tx.walletId }, {
+        lockMode: LockMode.PESSIMISTIC_WRITE,
+      });
+      if (!wallet || wallet.playerId !== tx.playerId) {
+        return this.rejectExisting(em, tx, FailureCode.ReferenceScopeMismatch, correlationId);
+      }
+      const balanceBefore = Money.rehydrate({ amount: wallet.balance, currency: wallet.currency });
+      const direction = this.directionFor(tx.kind, reference);
+      let status: 'PROCESSED' | 'REJECTED' = 'PROCESSED';
+      let failureCode: FailureCode | undefined;
+      let balanceAfter = balanceBefore;
+
+      if (direction === LedgerDirection.Debit) {
+        if (balanceBefore.isLessThan(money)) {
+          status = 'REJECTED';
+          failureCode = FailureCode.InsufficientBalanceForReversal; // regra 9
+        } else {
+          balanceAfter = balanceBefore.subtract(money);
+        }
+      } else if (direction === LedgerDirection.Credit) {
+        balanceAfter = balanceBefore.add(money);
+      }
+
+      const now = new Date();
+      tx.status = status;
+      tx.referenceTransactionId = reference.id;
+      if (status === 'REJECTED') {
+        tx.failureCode = failureCode;
+      } else if (direction !== undefined) {
+        tx.resultingBalance = balanceAfter.toJSON().amount;
+      }
+      tx.processedAt = now;
+      em.persist(tx);
+
+      if (status === 'PROCESSED' && direction !== undefined) {
+        const updated = await em.nativeUpdate(
+          WalletEntity,
+          { id: wallet.id, version: wallet.version },
+          {
+            balance: balanceAfter.toJSON().amount,
+            version: wallet.version + 1,
+            updatedAt: now,
+          },
+        );
+        if (updated === 0) throw new Error('CONCURRENT_MODIFICATION');
+
+        em.persist(em.create(WalletLedgerEntryEntity, {
+          id: randomUUID(),
+          walletId: wallet.id,
+          transactionId: tx.id,
+          direction,
+          amount: money.toJSON().amount,
+          currency: money.currency,
+          balanceBefore: balanceBefore.toJSON().amount,
+          balanceAfter: balanceAfter.toJSON().amount,
+          createdAt: now,
+        }));
+
+        em.persist(OutboxMessageEntity.enqueue(WalletBalanceChanged.from({
+          correlationId,
+          walletId: wallet.id,
+          transactionId: tx.id,
+          direction,
+          money: money.toJSON(),
+          balanceBefore: balanceBefore.toJSON(),
+          balanceAfter: balanceAfter.toJSON(),
+          walletVersion: wallet.version + 1,
+        })));
+      }
+
+      em.persist(OutboxMessageEntity.enqueue(
+        status === 'PROCESSED'
+          ? WagerTransactionProcessed.from({
+              correlationId,
+              transactionId: tx.id,
+              providerId: tx.providerId,
+              externalTransactionId: tx.externalTransactionId,
+              walletId: tx.walletId,
+              playerId: tx.playerId,
+              roundId: tx.roundId,
+              kind: tx.kind,
+              money: money.toJSON(),
+              referenceExternalTransactionId: tx.referenceExternalTransactionId,
+            })
+          : WagerTransactionRejected.from({
+              correlationId,
+              transactionId: tx.id,
+              providerId: tx.providerId,
+              externalTransactionId: tx.externalTransactionId,
+              walletId: tx.walletId,
+              kind: tx.kind,
+              failureCode: failureCode!,
+            }),
+      ));
+
+      await em.flush();
+      return {
+        transactionId: tx.id,
+        status,
+        failureCode,
+        balance: balanceAfter.toJSON(),
+        idempotentReplay: false,
+      };
+    });
   }
 
   // ---------- helpers ----------
@@ -353,6 +562,30 @@ export class SubmitWagerTransactionUseCase {
       externalTransactionId: dto.externalTransactionId,
       walletId: dto.walletId,
       kind: dto.kind,
+      failureCode: code,
+    })));
+    await em.flush();
+    return { transactionId: tx.id, status: 'REJECTED', failureCode: code, idempotentReplay: false };
+  }
+
+  /** REJECTED para transação já persistida como PENDING_REFERENCE (worker). */
+  private async rejectExisting(
+    em: EntityManager,
+    tx: WagerTransactionEntity,
+    code: FailureCode,
+    correlationId: string,
+  ): Promise<SubmitResult> {
+    tx.status = 'REJECTED';
+    tx.failureCode = code;
+    tx.processedAt = new Date();
+    em.persist(tx);
+    em.persist(OutboxMessageEntity.enqueue(WagerTransactionRejected.from({
+      correlationId,
+      transactionId: tx.id,
+      providerId: tx.providerId,
+      externalTransactionId: tx.externalTransactionId,
+      walletId: tx.walletId,
+      kind: tx.kind,
       failureCode: code,
     })));
     await em.flush();
@@ -425,8 +658,8 @@ export class SubmitWagerTransactionUseCase {
   }
 
   /**
-   * Transação REJECTADA sem Money validado — BUG 4: sanitiza o amount antes de
-   * gravar, senão 'abc'/'1e10' quebram o INSERT na coluna numeric(19,2) (500 em vez de 422).
+   * Transação REJECTADA sem Money validado — sanitiza o amount antes de gravar,
+   * senão 'abc'/'1e10' quebram o INSERT na coluna numeric(19,2).
    */
   private buildRawTransaction(
     dto: SubmitInput,

@@ -38,7 +38,6 @@ export class OutboxPublisherWorker {
           MessageGroupId: row.aggregate_id,
           MessageDeduplicationId: row.id,
         }));
-
         await this.em.getConnection().execute(
           `update outbox_messages set published_at = now() where id = ? and published_at is null`,
           [row.id],
