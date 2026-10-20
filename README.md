@@ -18,6 +18,9 @@
 
 ### ▶️ Diagrama animado — a história de uma aposta
 
+<img width="1200" height="680" alt="fluxo-bet" src="https://github.com/user-attachments/assets/98713620-65ce-400d-b3ec-d691a367e67a" />
+
+
 ![Fluxo de uma aposta BET — diagrama animado](docs/fluxo-bet.gif)
 
 Fluxo completo em 8 passos: envio da aposta → idempotência + lock pessimista → commit atômico →
